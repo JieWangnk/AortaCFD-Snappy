@@ -139,19 +139,81 @@ def main():
     parser.add_argument("--viscosity", type=float, default=3.5e-6, help="Kinematic viscosity (m²/s)")
     parser.add_argument("--yplus-band", nargs=2, type=float, default=[1.0, 5.0], help="Target Y+ range")
     parser.add_argument("--required-yplus-coverage", type=float, default=0.8, help="Required coverage fraction")
+    parser.add_argument("--checkmesh-log", type=Path, help="Path to checkMesh log file (ignored - we parse directly)")
+    parser.add_argument("--out", type=Path, help="Output file for metrics (optional)")
     
     args = parser.parse_args()
     
-    result = estimate_yplus_coverage(args.mesh_directory, args.velocity, args.viscosity)
+    yplus_result = estimate_yplus_coverage(args.mesh_directory, args.velocity, args.viscosity)
     
-    # Output JSON result for integration with main tool
-    print(json.dumps(result, indent=2))
+    # Create complete metrics structure expected by the quality assessment
+    full_metrics = {
+        'checkMesh': {},
+        'yPlus': yplus_result,
+        'acceptance': {
+            'mesh_ok': False,
+            'yPlus_ok': yplus_result.get('coverage_overall', 0.0) >= args.required_yplus_coverage
+        },
+        'all_ok': False,
+        'layerCoverage': {}
+    }
     
-    # Return appropriate exit code
-    coverage = result.get("coverage_overall", 0.0)
-    required = args.required_yplus_coverage
+    # Parse checkMesh log if it exists
+    checkmesh_log = args.mesh_directory / 'logs' / 'log.checkMesh'
+    if checkmesh_log.exists():
+        try:
+            content = checkmesh_log.read_text()
+            # Basic parsing of checkMesh results
+            import re
+            
+            patterns = {
+                'cells': r'cells:\s*(\d+)',
+                'faces': r'faces:\s*(\d+)',
+                'points': r'points:\s*(\d+)',
+                'maxNonOrtho': r'non-orthogonality.*?(\d+\.?\d*)',
+                'maxSkewness': r'skewness.*?(\d+\.?\d*)',
+                'maxAspectRatio': r'aspect ratio.*?(\d+\.?\d*)'
+            }
+            
+            for key, pattern in patterns.items():
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match:
+                    try:
+                        full_metrics['checkMesh'][key] = float(match.group(1))
+                    except ValueError:
+                        full_metrics['checkMesh'][key] = int(match.group(1))
+            
+            # Check for failed mesh
+            if 'Failed' in content and 'mesh check' in content:
+                full_metrics['checkMesh']['meshOK'] = False
+            else:
+                full_metrics['checkMesh']['meshOK'] = True
+                
+            # Basic mesh acceptance
+            full_metrics['acceptance']['mesh_ok'] = (
+                full_metrics['checkMesh'].get('maxNonOrtho', 100) <= 75 and
+                full_metrics['checkMesh'].get('maxSkewness', 10) <= 4.0 and
+                full_metrics['checkMesh'].get('meshOK', False)
+            )
+        except Exception:
+            pass
     
-    sys.exit(0 if coverage >= required else 1)
+    # Overall acceptance
+    full_metrics['all_ok'] = (
+        full_metrics['acceptance']['mesh_ok'] and
+        full_metrics['acceptance']['yPlus_ok']
+    )
+    
+    # Output to file if specified
+    if args.out:
+        args.out.write_text(json.dumps(full_metrics, indent=2))
+    
+    # Output JSON result to stdout
+    print(json.dumps(full_metrics, indent=2))
+    
+    # Always return 0 for successful execution - let the main tool decide on acceptance
+    # Return code 1 only for actual errors/failures
+    sys.exit(0)
 
 
 if __name__ == "__main__":

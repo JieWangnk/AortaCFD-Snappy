@@ -45,8 +45,7 @@ class QualityEvaluator:
         
         try:
             cmd = [
-                'python', str(eval_script),
-                '--case', str(iter_dir),
+                'python', str(eval_script), str(iter_dir),
                 '--checkmesh-log', str(iter_dir / 'logs' / 'log.checkMesh'),
                 '--yplus-band', str(yplus_band[0]), str(yplus_band[1]),
                 '--required-yplus-coverage', str(required_coverage),
@@ -62,7 +61,6 @@ class QualityEvaluator:
             
         except Exception as e:
             self.logger.warning(f"Professional evaluation failed: {e}")
-        
         return self._run_basic_evaluation(iter_dir)
     
     def _run_basic_evaluation(self, iter_dir: Path) -> Dict:

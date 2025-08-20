@@ -1,0 +1,66 @@
+{
+  "description": "Stage 1: Geometry-driven mesh optimization (baseline settings)",
+  
+  "BLOCKMESH": {
+    "resolution": 40,
+    "grading": [1, 1, 1]
+  },
+  
+  "SNAPPY": {
+    "surface_level": [2, 3],
+    "maxLocalCells": 5000000,
+    "maxGlobalCells": 20000000,
+    "nCellsBetweenLevels": 2,
+    "resolveFeatureAngle": 150,
+    "nSmoothPatch": 3,
+    "nFeatureSnapIter": 10,
+    "implicitFeatureSnap": false,
+    "explicitFeatureSnap": true,
+    "distance_refinement": {
+      "near_distance": 1.5,
+      "far_distance": 3.0
+    }
+  },
+  
+  "LAYERS": {
+    "enable": true,
+    "nSurfaceLayers": 8,
+    "finalLayerThickness_rel": 0.15,
+    "expansionRatio": 1.15,
+    "nGrow": 0,
+    "minThickness": 0.02,
+    "featureAngle": 130,
+    "maxThicknessToMedialRatio": 0.6,
+    "minMedianAxisAngle": 50
+  },
+  
+  "MESH_QUALITY": {
+    "snap": {
+      "maxNonOrtho": 75,
+      "maxBoundarySkewness": 4.0,
+      "maxInternalSkewness": 4.0,
+      "minVol": 1e-18,
+      "minTetQuality": 1e-12,
+      "minFaceWeight": 0.02,
+      "minVolCollapseRatio": 0.2
+    },
+    "layer": {
+      "maxNonOrtho": 70,
+      "maxBoundarySkewness": 4.0,
+      "maxInternalSkewness": 4.0,
+      "minVol": 1e-18,
+      "minTetQuality": 1e-12,
+      "minFaceWeight": 0.02,
+      "minVolCollapseRatio": 0.2
+    }
+  },
+  
+  "acceptance_criteria": {
+    "maxNonOrtho": 70,
+    "maxSkewness": 4.2,
+    "min_layer_coverage": 0.65
+  },
+  
+  "max_iterations": 4,
+  "openfoam_env_path": "/opt/openfoam12/etc/bashrc"
+}

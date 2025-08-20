@@ -1,0 +1,46 @@
+{
+  "description": "Stage 2: QoI-driven optimization for wall-resolved LES",
+  
+  "mesh_settings": {
+    "base_resolution": 80,
+    "surface_level": [4, 5],
+    "maxLocalCells": 20000000,
+    "maxGlobalCells": 80000000
+  },
+  
+  "layer_settings": {
+    "nSurfaceLayers": 20,
+    "finalLayerThickness_rel": 0.15,
+    "expansionRatio": 1.15
+  },
+  
+  "quality_criteria": {
+    "maxNonOrtho": 60,
+    "maxSkewness": 2.5,
+    "min_layer_coverage": 0.95
+  },
+  
+  "solver_settings": {
+    "application": "pimpleFoam",
+    "endTime": 0.5,
+    "deltaT": 0.0001,
+    "timeout": 3600
+  },
+  
+  "boundary_conditions": {
+    "U_inlet": 1.2,
+    "p_outlet": 0.0
+  },
+  
+  "qoi_criteria": {
+    "min_yplus_coverage": 0.95,
+    "target_yplus_range": [0.3, 1.5],
+    "max_yplus_wall": 2.0,
+    "min_velocity_stability": 0.01,
+    "min_pressure_stability": 0.005,
+    "min_wss_stability": 0.03,
+    "target_wall_spacing_plus": [40, 80]
+  },
+  
+  "max_iterations": 4
+}

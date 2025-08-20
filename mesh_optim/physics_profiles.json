@@ -1,0 +1,60 @@
+{
+  "description": "Physics-aware mesh profiles for Stage 2 optimization",
+  
+  "LAMINAR": {
+    "name": "Laminar Flow Profile",
+    "description": "Low-Reynolds cardiovascular flow (Re < 2000)",
+    "expected_cells": "0.5-0.8M",
+    "resolution_factor": 45,
+    "surface_refinement_level": [2, 3],
+    "n_surface_layers": 8,
+    "first_layer_thickness_factor": 0.1,
+    "y_plus_target": 5.0,
+    "expansion_ratio": 1.15,
+    "final_layer_thickness_rel": 0.2,
+    "solver_config": {
+      "solver": "simpleFoam",
+      "turbulence": "laminar",
+      "max_iterations": 500,
+      "convergence_criteria": 1e-6
+    }
+  },
+  
+  "RANS": {
+    "name": "RANS Flow Profile", 
+    "description": "Physiological cardiovascular flow (Re 2000-8000)",
+    "expected_cells": "1.0-2.0M",
+    "resolution_factor": 55,
+    "surface_refinement_level": [3, 4],
+    "n_surface_layers": 12,
+    "first_layer_thickness_factor": 0.05,
+    "y_plus_target": 1.0,
+    "expansion_ratio": 1.12,
+    "final_layer_thickness_rel": 0.15,
+    "solver_config": {
+      "solver": "simpleFoam",
+      "turbulence": "kOmegaSST", 
+      "max_iterations": 1000,
+      "convergence_criteria": 1e-5
+    }
+  },
+  
+  "LES": {
+    "name": "LES Flow Profile",
+    "description": "High-fidelity turbulent flow (Re > 5000)",  
+    "expected_cells": "3.0-8.0M",
+    "resolution_factor": 75,
+    "surface_refinement_level": [4, 5],
+    "n_surface_layers": 15,
+    "first_layer_thickness_factor": 0.02,
+    "y_plus_target": 0.5,
+    "expansion_ratio": 1.08,
+    "final_layer_thickness_rel": 0.12,
+    "solver_config": {
+      "solver": "pimpleFoam",
+      "turbulence": "LES",
+      "max_iterations": 2000,
+      "convergence_criteria": 1e-6
+    }
+  }
+}

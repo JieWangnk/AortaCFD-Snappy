@@ -1,0 +1,22 @@
+# AortaCFD-Snappy Requirements
+# Core dependencies for automated mesh optimization
+
+# Numerical computing
+numpy>=1.20.0
+
+# STL file processing
+numpy-stl>=2.16.0
+
+# Standard library dependencies (included with Python 3.8+)
+# - json (built-in)
+# - pathlib (built-in)
+# - subprocess (built-in)
+# - argparse (built-in)
+# - logging (built-in)
+# - datetime (built-in)
+# - shutil (built-in)
+# - re (built-in)
+
+# Optional dependencies for enhanced functionality
+# matplotlib>=3.3.0  # For plotting mesh quality metrics
+# scipy>=1.7.0       # For advanced numerical analysis

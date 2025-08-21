@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import logging
 from .utils import run_command, check_mesh_quality, parse_layer_coverage
+from .physics_mesh import PhysicsAwareMeshGenerator
 
 class Stage1MeshOptimizer:
     """Geometry-driven mesh optimizer"""
@@ -73,26 +74,70 @@ class Stage1MeshOptimizer:
         return stl_files
     
     def calculate_bbox_and_base_cell_size(self):
-        """Calculate bounding box and base cell size from geometry"""
-        # For now, use the approach from the original mesh_optimize.py
-        # TODO: Implement proper STL bbox calculation
-        
-        # Typical aorta dimensions (mm)
-        bbox_min = np.array([-20.6, -40.0, -57.1])
-        bbox_max = np.array([8.6, 7.2, 37.1])
-        bbox_size = bbox_max - bbox_min
-        
-        # Calculate base cell size
-        resolution = self.config["BLOCKMESH"]["resolution"]
-        max_dim = np.max(bbox_size)
-        base_cell_size = max_dim / resolution
-        
-        return {
-            "bbox_min": bbox_min,
-            "bbox_max": bbox_max,
-            "bbox_size": bbox_size,
-            "base_cell_size": base_cell_size
-        }
+        """Calculate bounding box and base cell size from actual STL geometry"""
+        try:
+            # Initialize physics generator to compute bounding box
+            physics_gen = PhysicsAwareMeshGenerator()
+            
+            # Collect all STL files
+            stl_files = {}
+            for name, path in self.stl_files["required"].items():
+                stl_files[name] = path
+            for outlet_path in self.stl_files["outlets"]:
+                stl_files[outlet_path.stem] = outlet_path
+            
+            # Compute bounding box from STL files
+            bbox_data = physics_gen.compute_stl_bounding_box(stl_files)
+            
+            if bbox_data["total_vertices"] == 0:
+                self.logger.warning("No vertices found in STL files, using default bounding box")
+            else:
+                self.logger.info(f"Computed bounding box from {bbox_data['total_vertices']} vertices")
+            
+            # Extract mesh domain (in meters)
+            mesh_domain = bbox_data["mesh_domain"]
+            
+            # Convert to mm for OpenFOAM (typical convention)
+            bbox_min = np.array([mesh_domain["x_min"], mesh_domain["y_min"], mesh_domain["z_min"]]) * 1000
+            bbox_max = np.array([mesh_domain["x_max"], mesh_domain["y_max"], mesh_domain["z_max"]]) * 1000
+            bbox_size = bbox_max - bbox_min
+            
+            # Calculate base cell size
+            resolution = self.config["BLOCKMESH"]["resolution"]
+            max_dim = np.max(bbox_size)
+            base_cell_size = max_dim / resolution
+            
+            self.logger.info(f"Computed bounding box: {bbox_min} to {bbox_max} mm")
+            self.logger.info(f"Base cell size: {base_cell_size:.2f} mm")
+            
+            return {
+                "bbox_min": bbox_min,
+                "bbox_max": bbox_max,
+                "bbox_size": bbox_size,
+                "base_cell_size": base_cell_size,
+                "bbox_data": bbox_data  # Include full bounding box data
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to compute STL bounding box: {e}")
+            self.logger.info("Falling back to default aortic dimensions")
+            
+            # Fallback to typical aorta dimensions (mm)
+            bbox_min = np.array([-20.6, -40.0, -57.1])
+            bbox_max = np.array([8.6, 7.2, 37.1])
+            bbox_size = bbox_max - bbox_min
+            
+            # Calculate base cell size
+            resolution = self.config["BLOCKMESH"]["resolution"]
+            max_dim = np.max(bbox_size)
+            base_cell_size = max_dim / resolution
+            
+            return {
+                "bbox_min": bbox_min,
+                "bbox_max": bbox_max,
+                "bbox_size": bbox_size,
+                "base_cell_size": base_cell_size
+            }
     
     def generate_blockmesh_dict(self, iter_dir):
         """Generate blockMeshDict"""
@@ -351,7 +396,7 @@ castellatedMeshControls
 
     locationInMesh ({internal_point[0]:.6f} {internal_point[1]:.6f} {internal_point[2]:.6f});
     allowFreeStandingZoneFaces true;
-    resolveFeatureAngle {snap_config.get("resolveFeatureAngle", 150)};
+    resolveFeatureAngle {snap_config.get("resolveFeatureAngle", 30)};  // Reasonable feature angle
 }}
 
 snapControls
@@ -448,7 +493,7 @@ castellatedMeshControls
     nCellsBetweenLevels 1;
     locationInMesh ({internal_point[0]:.6f} {internal_point[1]:.6f} {internal_point[2]:.6f});
     allowFreeStandingZoneFaces true;
-    resolveFeatureAngle 150;
+    resolveFeatureAngle 30;  // Reasonable feature angle for layer generation
 }}
 
 snapControls
@@ -462,7 +507,7 @@ snapControls
 
 addLayersControls
 {{
-    relativeSizes true;
+    relativeSizes false;  // Use absolute sizes for proper physics
     
     layers
     {{
@@ -472,11 +517,12 @@ addLayersControls
         }}
     }}
 
+    // Physics-based absolute layer sizes
+    firstLayerThickness {layers_config.get("firstLayerThickness_abs", 50e-6)};  // 50µm default
     expansionRatio {layers_config["expansionRatio"]};
-    finalLayerThickness {layers_config["finalLayerThickness_rel"]};
-    minThickness {layers_config["minThickness"]};
+    minThickness {layers_config.get("minThickness_abs", 20e-6)};  // 20µm minimum
     nGrow {layers_config["nGrow"]};
-    featureAngle {layers_config["featureAngle"]};
+    featureAngle {min(layers_config["featureAngle"], 90)};  // Cap at 90 degrees
     nRelaxIter 5;
     nSmoothSurfaceNormals 3;
     nSmoothNormals 5;

@@ -55,12 +55,31 @@ python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS
 - **numpy, scipy** (for geometry calculations)
 
 ### Installation
+
+**Recommended: Use a virtual environment to avoid dependency conflicts**
+
+```bash
+# Clone repository
+git clone https://github.com/YourUsername/AortaCFD-Snappy.git
+cd AortaCFD-Snappy
+
+# Create and activate virtual environment (recommended)
+python3 -m venv mesh_optim_env
+source mesh_optim_env/bin/activate  # On Linux/Mac
+# mesh_optim_env\Scripts\activate   # On Windows
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Ensure OpenFOAM is sourced
+source /opt/openfoam12/etc/bashrc
+```
+
+**Alternative: System-wide installation**
 ```bash
 git clone https://github.com/YourUsername/AortaCFD-Snappy.git
 cd AortaCFD-Snappy
 pip install -r requirements.txt
-
-# Ensure OpenFOAM is sourced
 source /opt/openfoam12/etc/bashrc
 ```
 
@@ -338,6 +357,21 @@ source /opt/openfoam12/etc/bashrc
 ```
 **Solution**: Ensure geometry directory contains all required STL files with correct names.
 
+**5. Python Package Import Errors**
+```
+❌ ModuleNotFoundError: No module named 'numpy'
+❌ ImportError: cannot import name 'mesh_optim'
+```
+**Solution**: Ensure you're using the correct Python environment:
+```bash
+# If using virtual environment
+source mesh_optim_env/bin/activate
+pip install -r requirements.txt
+
+# Verify installation
+python -c "import numpy; print('Dependencies OK')"
+```
+
 ### Debug Mode
 ```bash
 python -m mesh_optim stage1 --geometry tutorial/patient1 --verbose
@@ -388,8 +422,19 @@ We welcome contributions! Areas of interest:
 ```bash
 git clone https://github.com/YourUsername/AortaCFD-Snappy.git
 cd AortaCFD-Snappy
-pip install -e .
+
+# Create development virtual environment
+python3 -m venv dev_env
+source dev_env/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run tests (if available)
 python -m pytest tests/
+
+# Ensure OpenFOAM is sourced for development
+source /opt/openfoam12/etc/bashrc
 ```
 
 ---

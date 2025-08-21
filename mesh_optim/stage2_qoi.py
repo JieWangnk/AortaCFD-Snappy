@@ -14,6 +14,7 @@ import math
 from .utils import run_command, check_mesh_quality, parse_layer_coverage
 from .stage1_mesh import Stage1MeshOptimizer
 from .cfd_solver import CFDSolver
+from .physics_mesh import PhysicsAwareMeshGenerator
 
 class Stage2QOIOptimizer:
     """QoI-driven mesh optimizer for laminar/RANS/LES"""
@@ -41,8 +42,8 @@ class Stage2QOIOptimizer:
         # Setup logging first
         self.logger = logging.getLogger(f"Stage2QOI_{self.geometry_dir.name}_{flow_model}")
         
-        # Load physics profile
-        self.physics_profile = self._load_physics_profile(flow_model)
+        # Initialize physics-aware mesh generator
+        self.physics_generator = PhysicsAwareMeshGenerator(flow_model)
         
         # Load or create configuration
         if config_file:
@@ -65,11 +66,20 @@ class Stage2QOIOptimizer:
         # Find STL files
         self.stl_files = self._discover_stl_files()
         
-        # Estimate geometry parameters
-        self.geometry_params = self._estimate_geometry_parameters()
+        # Get physics-aware mesh parameters with automatic geometry analysis
+        self.mesh_params = self.physics_generator.get_flow_regime_parameters(
+            geometry_dir=self.geometry_dir
+        )
+        
+        # Extract geometry parameters for compatibility
+        self.geometry_params = {
+            "inlet_diameter": self.mesh_params.get("minimum_diameter", 25e-3),
+            "peak_velocity": self.mesh_params.get("peak_velocity", 1.0),
+            "reynolds": self.mesh_params.get("reynolds", 7000)
+        }
         
         # Communicate expectations to user
-        self._print_profile_summary()
+        self._print_physics_summary()
         
         # Initialize CFD solver
         self.cfd_solver = CFDSolver(
@@ -277,14 +287,13 @@ class Stage2QOIOptimizer:
             return {"success": False, "error": str(e)}
     
     def _create_stage1_config_from_qoi(self):
-        """Create Stage 1 configuration with QoI physics parameters using profile"""
+        """Create Stage 1 configuration using physics-aware parameters"""
         
-        profile = self.physics_profile
+        # Use physics generator parameters directly
+        params = self.mesh_params
         
-        # Calculate base cell size from diameter using profile
-        D = self.geometry_params["inlet_diameter"]
-        resolution_factor = profile.get("resolution_factor", 55)
-        base_cell_size = D / resolution_factor
+        # Calculate base cell size from physics parameters
+        base_cell_size = params.get("base_cell_target", 0.5e-3)
         
         # Estimate blocks needed
         bbox_size = 0.094  # ~94mm aorta length
@@ -299,7 +308,7 @@ class Stage2QOIOptimizer:
             },
             
             "SNAPPY": {
-                "surface_level": profile.get("surface_refinement_level", [3, 4]),
+                "surface_level": params.get("surface_refinement_level", [3, 4]),
                 "maxLocalCells": 10000000,
                 "maxGlobalCells": 50000000,
                 "nCellsBetweenLevels": 2,
@@ -309,18 +318,18 @@ class Stage2QOIOptimizer:
                 "implicitFeatureSnap": False,
                 "explicitFeatureSnap": True,
                 "distance_refinement": {
-                    "near_distance": self.config["distance_refinement"]["near_distance"] * 1000,  # Convert to mm
-                    "far_distance": self.config["distance_refinement"]["far_distance"] * 1000
+                    "near_distance": params.get("distance_refinement", {}).get("near_distance", 1.5e-3) * 1000,  # Convert to mm
+                    "far_distance": params.get("distance_refinement", {}).get("far_distance", 3.0e-3) * 1000
                 }
             },
             
             "LAYERS": {
                 "enable": True,
-                "nSurfaceLayers": profile.get("n_surface_layers", 12),
-                "finalLayerThickness_rel": profile.get("final_layer_thickness_rel", 0.15),
-                "expansionRatio": profile.get("expansion_ratio", 1.12),
+                "nSurfaceLayers": params.get("n_surface_layers", 12),
+                "finalLayerThickness_rel": params.get("first_layer_thickness", 50e-6) / base_cell_size,
+                "expansionRatio": params.get("expansion_ratio", 1.12),
                 "nGrow": 1,
-                "minThickness": self.config["first_layer_thickness"] * 0.4,
+                "minThickness": params.get("first_layer_thickness", 50e-6) * 0.4,
                 "featureAngle": 130,
                 "maxThicknessToMedialRatio": 0.6,
                 "minMedianAxisAngle": 50
@@ -604,36 +613,44 @@ class Stage2QOIOptimizer:
                 "surface_refinement_level": [3, 4] if flow_model == "RANS" else [2, 3]
             }
     
-    def _print_profile_summary(self):
-        """Print comprehensive profile summary for user awareness"""
+    def _print_physics_summary(self):
+        """Print comprehensive physics-based summary for user awareness"""
         
-        profile = self.physics_profile
-        D = self.geometry_params["inlet_diameter"] * 1000  # mm
-        Re = self.geometry_params["reynolds"]
+        params = self.mesh_params
+        D = params.get("minimum_diameter", 25e-3) * 1000  # mm
+        Re = params.get("reynolds", 7000)
+        flow_regime = params.get("flow_regime", "unknown")
         
-        # Calculate expected mesh characteristics
-        base_cell_size = D / profile.get("resolution_factor", 50)
-        first_layer_um = self.config.get("first_layer_thickness", 0.00005) * 1e6
-        n_layers = profile.get("n_surface_layers", 8)
-        surface_levels = profile.get("surface_refinement_level", [2, 3])
+        # Physics calculations
+        first_layer_um = params.get("first_layer_microns", 50)
+        n_layers = params.get("n_surface_layers", 12)
+        surface_levels = params.get("surface_refinement_level", [3, 4])
+        base_cell_size = params.get("base_cell_target", 0.5e-3) * 1000  # mm
+        target_cells = params.get("target_cells_range", [1e6, 5e6])
         
-        self.logger.info("=" * 60)
-        self.logger.info(f"🔬 STAGE 2 PHYSICS PROFILE: {profile['name']}")
-        self.logger.info("=" * 60)
-        self.logger.info(f"📐 Geometry: D={D:.1f}mm, Re={Re:.0f}")
-        self.logger.info(f"🔧 Flow Model: {self.flow_model} ({profile.get('description', 'N/A')})")
-        self.logger.info(f"📦 Expected Cells: {profile.get('expected_cells', 'Unknown')}")
-        self.logger.info(f"⚙️  Mesh Parameters:")
-        self.logger.info(f"   - Base cell size: {base_cell_size:.2f}mm")
+        self.logger.info("=" * 70)
+        self.logger.info(f"🔬 PHYSICS-AWARE STAGE 2: {self.flow_model} Flow Regime")
+        self.logger.info("=" * 70)
+        self.logger.info(f"📐 Geometry Analysis: D_min={D:.1f}mm, Re={Re:.0f} ({flow_regime})")
+        
+        # Show pulsatile effects if detected
+        if params.get("womersley"):
+            wom = params["womersley"]
+            self.logger.info(f"💓 Pulsatile Flow: α={wom:.1f} (Womersley number)")
+            if params.get("pulsatile_correction"):
+                self.logger.info("   ⚠️  High α detected - y+ target adjusted for thick viscous layer")
+        
+        self.logger.info(f"🔧 Flow Model: {self.flow_model}")
+        self.logger.info(f"📦 Expected Cells: {target_cells[0]/1e6:.1f}-{target_cells[1]/1e6:.1f}M")
+        self.logger.info(f"⚙️  Physics-Based Mesh Parameters:")
+        self.logger.info(f"   - Base cell size: {base_cell_size:.2f}mm (D/{D/base_cell_size:.0f})")
         self.logger.info(f"   - Surface refinement: {surface_levels}")
         self.logger.info(f"   - First layer: {first_layer_um:.1f}µm ({n_layers} layers)")
-        self.logger.info(f"   - Target y+: {profile.get('y_plus_target', 'N/A')}")
+        self.logger.info(f"   - Target y+: {params.get('target_yplus', 1.0)}")
+        self.logger.info(f"   - Friction regime: {flow_regime} (Cf={params.get('friction_coefficient', 0.05):.4f})")
         
-        solver_info = profile.get('solver_config', {})
-        if solver_info:
-            self.logger.info(f"🌊 CFD Solver: {solver_info.get('solver', 'N/A')} ({solver_info.get('turbulence', 'N/A')})")
-        
-        self.logger.info("=" * 60)
+        self.logger.info(f"🌊 CFD Solver: {self.flow_model.lower()}Foam")
+        self.logger.info("=" * 70)
         self.logger.info("ℹ️  Stage 2 builds a NEW physics-optimized mesh from scratch")
-        self.logger.info("   (does not refine existing Stage 1 mesh)")
-        self.logger.info("=" * 60)
+        self.logger.info("   Uses correct friction laws, minimum diameter, and pulsatile effects")
+        self.logger.info("=" * 70)

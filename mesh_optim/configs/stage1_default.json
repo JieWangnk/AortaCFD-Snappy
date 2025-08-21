@@ -11,7 +11,7 @@
     "maxLocalCells": 5000000,
     "maxGlobalCells": 20000000,
     "nCellsBetweenLevels": 2,
-    "resolveFeatureAngle": 150,
+    "resolveFeatureAngle": 30,
     "nSmoothPatch": 3,
     "nFeatureSnapIter": 10,
     "implicitFeatureSnap": false,
@@ -24,14 +24,17 @@
   
   "LAYERS": {
     "enable": true,
-    "nSurfaceLayers": 8,
+    "nSurfaceLayers": 6,
+    "firstLayerThickness_abs": 1e-5,
+    "totalThickness_abs": 0.0005,
     "finalLayerThickness_rel": 0.15,
-    "expansionRatio": 1.15,
+    "expansionRatio": 1.25,
     "nGrow": 0,
     "minThickness": 0.02,
-    "featureAngle": 130,
-    "maxThicknessToMedialRatio": 0.6,
-    "minMedianAxisAngle": 50
+    "minThickness_abs": 5e-6,
+    "featureAngle": 60,
+    "maxThicknessToMedialRatio": 0.3,
+    "minMedianAxisAngle": 70
   },
   
   "MESH_QUALITY": {

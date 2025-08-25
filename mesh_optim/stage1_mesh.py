@@ -7,8 +7,9 @@ Stage 1: Geometry‑aware, geometry‑only mesh optimization (snap→checkMesh�
 - Constraint-based: minimize cells subject to maxNonOrtho/maxSkewness/layer-coverage
 - All units normalized to meters; STLs are scaled by 0.001 if mm-as-m coordinates are detected
 
-This file is a drop‑in replacement for the previous Stage1MeshOptimizer. It keeps
-your utils contracts: run_command, check_mesh_quality, parse_layer_coverage.
+LEGACY COMPATIBILITY LAYER: This file maintains backward compatibility while
+the new modular architecture is being integrated. New code should use
+the stage1.optimizer module directly.
 
 Configuration additions expected (example):
 
@@ -93,6 +94,16 @@ from typing import Dict, Tuple, List
 from .utils import run_command, check_mesh_quality, parse_layer_coverage, calculate_first_layer_thickness
 from .physics_mesh import PhysicsAwareMeshGenerator
 
+# Import new modular components with backward compatibility fallback
+try:
+    from .stage1.optimizer import Stage1Optimizer
+    from .stage1.config_manager import ConfigManager
+    MODULAR_AVAILABLE = True
+except ImportError as e:
+    import logging
+    logging.getLogger(__name__).warning(f"Modular components not available: {e}")
+    MODULAR_AVAILABLE = False
+
 # ==================== HELPER FUNCTIONS (ChatGPT improvements) ====================
 
 
@@ -115,7 +126,12 @@ def _safe_get(d: dict, path: List[str], default=None):
 
 
 class Stage1MeshOptimizer:
-    """Geometry‑aware Stage‑1 mesh optimizer (geometry only, meters everywhere)."""
+    """Geometry‑aware Stage‑1 mesh optimizer (geometry only, meters everywhere).
+    
+    LEGACY COMPATIBILITY CLASS: This class provides backward compatibility
+    while the new modular architecture (stage1.optimizer) is being integrated.
+    For new code, use stage1.optimizer.Stage1Optimizer directly.
+    """
 
     def __init__(self, geometry_dir, config_file, output_dir=None):
         self.geometry_dir = Path(geometry_dir)
@@ -136,6 +152,23 @@ class Stage1MeshOptimizer:
         self._validate_layers_config()
 
         self.logger = logging.getLogger(f"Stage1Mesh_{self.geometry_dir.name}")
+
+        # Initialize modular optimizer if available
+        if MODULAR_AVAILABLE:
+            try:
+                geometry_stl = self._find_geometry_stl()
+                self._modular_optimizer = Stage1Optimizer(
+                    str(self.config_file), 
+                    str(geometry_stl),
+                    str(self.output_dir)
+                )
+                self._use_modular = True
+                self.logger.info("Using new modular optimizer")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize modular optimizer: {e}")
+                self._use_modular = False
+        else:
+            self._use_modular = False
 
         # Resource management
         import psutil
@@ -2493,7 +2526,20 @@ method          scotch;
 
     # ------------------------------- Loop ---------------------------------
     def iterate_until_quality(self):
-        self.logger.info("Starting Stage‑1 geometry‑aware optimization")
+        """
+        Main entry point for Stage1 mesh optimization.
+        
+        COMPATIBILITY: This method now delegates to the new modular optimizer
+        when available, falling back to legacy implementation for compatibility.
+        """
+        # Try to use new modular optimizer if available
+        if hasattr(self, '_use_modular') and self._use_modular:
+            try:
+                return self._run_modular_optimization()
+            except Exception as e:
+                self.logger.warning(f"Modular optimizer failed, falling back to legacy: {e}")
+        
+        self.logger.info("Starting Stage‑1 geometry‑aware optimization (LEGACY MODE)")
         # Note: bbox_data, diameters, and dx will be computed from scaled STL files in each iteration
         # This avoids loading STL files twice (once original, once scaled)
 
@@ -2754,4 +2800,68 @@ method          scotch;
         self.logger.info(f"🚀 Ready for Stage-2 physics verification (GCI analysis)")
         
         return best_out
+
+    # ==================== MODULAR COMPATIBILITY METHODS ====================
+    
+    def _find_geometry_stl(self):
+        """Find the STL geometry file in the geometry directory"""
+        stl_files = list(self.geometry_dir.glob("*.stl"))
+        if not stl_files:
+            raise FileNotFoundError(f"No STL files found in {self.geometry_dir}")
+        
+        # Prefer files with specific patterns
+        for pattern in ["wall_", "geometry", "aorta"]:
+            matching_files = [f for f in stl_files if pattern.lower() in f.name.lower()]
+            if matching_files:
+                return matching_files[0]
+        
+        # Return first STL file found
+        return stl_files[0]
+    
+    def _run_modular_optimization(self):
+        """Run optimization using the new modular system"""
+        self.logger.info("Delegating to modular Stage1Optimizer")
+        
+        try:
+            # Extract configuration parameters
+            max_iterations = self.stage1.get("max_iterations", 10)
+            
+            # Run modular optimization
+            result = self._modular_optimizer.run_full_optimization(
+                max_iterations=max_iterations,
+                parallel_procs=1  # Single processor for compatibility
+            )
+            
+            # Convert modular result to legacy format
+            best_out = self.output_dir / "best"
+            if result.get('final_mesh_directory'):
+                final_mesh = Path(result['final_mesh_directory'])
+                if final_mesh.exists():
+                    if best_out.exists():
+                        shutil.rmtree(best_out)
+                    shutil.copytree(final_mesh, best_out)
+                    
+                    # Save config for Stage 2 compatibility
+                    config_out = best_out / "config.json"
+                    with open(config_out, "w") as f:
+                        json.dump(self.config, f, indent=2)
+            
+            # Log results in legacy format
+            status = result.get('status', 'unknown')
+            if result.get('optimization_results', {}).get('best_iteration'):
+                best_iter = result['optimization_results']['best_iteration']
+                cell_count = best_iter.get('layer_metrics', {}).get('cells', 0)
+                quality_score = best_iter.get('quality_score', 0)
+                
+                self.logger.info(f"🎯 Stage-1 {status.upper()}: Best mesh has {cell_count:,} cells "
+                               f"(quality score: {quality_score:.3f})")
+            
+            self.logger.info(f"📁 Best Stage-1 mesh exported to: {best_out}")
+            self.logger.info(f"🚀 Ready for Stage-2 physics verification")
+            
+            return best_out
+            
+        except Exception as e:
+            self.logger.error(f"Modular optimization failed: {e}")
+            raise
 

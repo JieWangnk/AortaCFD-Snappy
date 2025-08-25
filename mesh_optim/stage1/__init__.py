@@ -19,7 +19,7 @@ Usage:
 """
 
 # Import main class for backward compatibility
-from .optimizer import Stage1MeshOptimizer
+from .optimizer import Stage1Optimizer as Stage1MeshOptimizer
 
 # Import key dataclasses for external use
 from .constants import MeshQualityLimits, LayerParams, PhysicsConstants

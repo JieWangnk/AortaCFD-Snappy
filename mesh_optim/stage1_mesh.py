@@ -90,7 +90,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
 
-from .utils import run_command, check_mesh_quality, parse_layer_coverage
+from .utils import run_command, check_mesh_quality, parse_layer_coverage, calculate_first_layer_thickness
 from .physics_mesh import PhysicsAwareMeshGenerator
 
 # ==================== HELPER FUNCTIONS (ChatGPT improvements) ====================
@@ -131,6 +131,9 @@ class Stage1MeshOptimizer:
         
         # Map from new two-tier structure to internal format if needed
         self._map_config_structure()
+        
+        # Validate and set defaults for critical LAYERS configuration
+        self._validate_layers_config()
 
         self.logger = logging.getLogger(f"Stage1Mesh_{self.geometry_dir.name}")
 
@@ -149,6 +152,9 @@ class Stage1MeshOptimizer:
         self.max_iterations = int(self.stage1.get("max_iterations", self.config.get("max_iterations", 4)))
         self.logger.debug(f"Max iterations: {self.max_iterations} (from {'STAGE1' if 'max_iterations' in self.stage1 else 'root' if 'max_iterations' in self.config else 'default'})")
         self.surface_levels = list(_safe_get(self.config, ["SNAPPY", "surface_level"], [1, 1]))
+        
+        # Convergence tracking
+        self.quality_history = []
 
         # Discover wall patch name generically
         self.wall_name = self._discover_wall_name()
@@ -278,6 +284,49 @@ class Stage1MeshOptimizer:
                             self.config[section] = {}
                         self.config[section].update(advanced[section])
 
+    def _validate_layers_config(self):
+        """Validate and set defaults for critical LAYERS configuration block"""
+        # Ensure LAYERS section exists
+        self.config.setdefault("LAYERS", {})
+        L = self.config["LAYERS"]
+        
+        # Set critical defaults with validation
+        L.setdefault("nSurfaceLayers", 14)
+        L.setdefault("expansionRatio", 1.2)
+        L.setdefault("firstLayerThickness_abs", 50e-6)  # 50 microns
+        L.setdefault("minThickness_abs", 20e-6)         # 20 microns  
+        L.setdefault("nGrow", 1)
+        L.setdefault("featureAngle", 70)
+        L.setdefault("maxThicknessToMedialRatio", 0.45)
+        L.setdefault("minMedianAxisAngle", 70)
+        L.setdefault("maxBoundarySkewness", 4.0)
+        L.setdefault("maxInternalSkewness", 4.0)
+        
+        # Validate ranges for critical parameters
+        if not (5 <= L["nSurfaceLayers"] <= 25):
+            L["nSurfaceLayers"] = max(5, min(25, L["nSurfaceLayers"]))
+            
+        if not (1.1 <= L["expansionRatio"] <= 2.0):
+            L["expansionRatio"] = max(1.1, min(2.0, L["expansionRatio"]))
+            
+        if not (10e-6 <= L["firstLayerThickness_abs"] <= 200e-6):
+            L["firstLayerThickness_abs"] = max(10e-6, min(200e-6, L["firstLayerThickness_abs"]))
+            
+        if not (5e-6 <= L["minThickness_abs"] <= 100e-6):
+            L["minThickness_abs"] = max(5e-6, min(100e-6, L["minThickness_abs"]))
+            
+        # Ensure minThickness <= firstLayerThickness
+        if L["minThickness_abs"] > L["firstLayerThickness_abs"]:
+            L["minThickness_abs"] = L["firstLayerThickness_abs"] * 0.5
+            
+        # Log validation results
+        validation_msg = (f"LAYERS validated: n={L['nSurfaceLayers']}, "
+                         f"ratio={L['expansionRatio']:.2f}, "
+                         f"first={L['firstLayerThickness_abs']*1e6:.1f}μm, "
+                         f"min={L['minThickness_abs']*1e6:.1f}μm")
+        # Use debug level during init to avoid spam
+        logging.getLogger().debug(validation_msg)
+
     def _apply_solver_presets(self):
         """Apply solver-specific acceptance criteria based on intended physics"""
         solver_mode = self.physics.get("solver_mode", "").upper()
@@ -386,16 +435,18 @@ class Stage1MeshOptimizer:
         n_procs = self.stage1.get("n_processors", 1)
         kb_per_cell = self.stage1.get("cell_budget_kb_per_cell", 2.0)
         
-        # Calculate memory-aware limits
-        # Use 70% of available memory for safety
-        usable_gb = available_gb * 0.7
-        usable_kb = usable_gb * 1024 * 1024
+        # OpenFOAM-specific memory modeling
+        usable_gb = available_gb * 0.7  # 70% safety margin
+        max_cells = self._openfoam_memory_model(usable_gb, n_procs)
         
-        # Calculate total cells budget
-        total_cells = int(usable_kb / max(kb_per_cell, 0.5))
+        self.logger.info(f"OpenFOAM memory model: {usable_gb:.1f}GB usable → max {max_cells:,} cells")
         
-        # Distribute across processors
-        max_local = int(np.clip(total_cells // max(n_procs, 1), 100_000, 5_000_000))
+        # Use OpenFOAM-aware cell budget
+        total_cells = max_cells
+        
+        # Distribute across processors with OpenFOAM communication patterns
+        # Each processor needs some overlap cells, so local limit is slightly higher
+        max_local = int(np.clip(total_cells // max(n_procs, 1) * 1.1, 100_000, 5_000_000))
         max_global = int(np.clip(total_cells, 500_000, 20_000_000))
         
         # Apply limits but allow config overrides
@@ -1039,27 +1090,19 @@ class Stage1MeshOptimizer:
 
     def _estimate_first_layer_from_yplus(self, D_ref, U_peak, rho, mu, y_plus, model="turbulent"):
         """Estimate first layer thickness from y+ target for wall-resolved meshing"""
-        # Rough Cf approximation (Dean formula for turbulent, Hagen-Poiseuille for laminar)
+        # Use the robust implementation from utils.py
+        blood_properties = {
+            'density': rho,
+            'viscosity': mu
+        }
+        
+        # The utils function calculates for y+ = 1, so scale by target y+
+        base_thickness = calculate_first_layer_thickness(U_peak, D_ref, blood_properties)
+        first_layer = base_thickness * y_plus
+        
+        # Log for consistency with existing interface
         Re = rho * U_peak * D_ref / max(mu, 1e-9)
-        
-        if model == "laminar" or Re < 2300:
-            # Laminar: Cf = 16/Re (Hagen-Poiseuille)
-            Cf = 16.0 / max(Re, 1.0)
-        else:
-            # Turbulent: Cf ≈ 0.073 Re^-0.25 (Dean correlation)
-            Cf = 0.073 * max(Re, 1.0) ** (-0.25)
-        
-        # Wall shear stress and friction velocity
-        tauw = 0.5 * rho * (U_peak ** 2) * Cf
-        u_tau = math.sqrt(max(tauw, 1e-12) / rho)
-        
-        # First cell center distance from y+ definition: y+ = y*u_tau*rho/mu
-        y = y_plus * mu / max(rho * u_tau, 1e-12)
-        
-        # Convert to first-layer thickness (cell height) ~ y_center * 2 for safety
-        first_layer = 2.0 * y
-        
-        self.logger.info(f"y+ based first layer: Re={Re:.0f}, Cf={Cf:.4f}, u_tau={u_tau:.3f}, y+={y_plus} → {first_layer*1e6:.1f} μm")
+        self.logger.info(f"y+ based first layer: Re={Re:.0f}, y+={y_plus}, model={model} → {first_layer*1e6:.1f} μm")
         return first_layer
 
     def _womersley_boundary_layer(self, heart_rate_hz, nu):
@@ -1299,6 +1342,219 @@ runTimeModifiable true;
 
         return outlet_names
     
+    def _curvature_adaptive_levels(self, base_levels, curvature_strength):
+        """Adapt refinement levels based on surface curvature for better flow resolution"""
+        min_level, max_level = base_levels[0], base_levels[1]
+        
+        if curvature_strength > 0.7:  # High curvature (aneurysms, stenoses)
+            # Boost both levels for aggressive near-wall refinement
+            adapted_min = min(min_level + 1, 3)  # Cap at level 3
+            adapted_max = min(max_level + 1, 4)  # Cap at level 4
+            self.logger.info(f"High curvature detected (>{0.7:.1f}) - aggressive refinement")
+        elif curvature_strength > 0.4:  # Moderate curvature (bifurcations)
+            # Boost max level for better boundary layer capture
+            adapted_min = min_level
+            adapted_max = min(max_level + 1, 3)  # Conservative boost
+            self.logger.info(f"Moderate curvature detected (>{0.4:.1f}) - enhanced max refinement")
+        else:  # Low curvature (straight vessels)
+            # Use base levels as-is
+            adapted_min, adapted_max = min_level, max_level
+            self.logger.info("Low curvature - using base refinement levels")
+            
+        return [adapted_min, adapted_max]
+    
+    def _optimized_quality_check(self, iter_dir, n_procs, env, logs, phase_name):
+        """Optimized quality checking with minimal reconstruction cycles"""
+        if n_procs > 1:
+            # Try parallel checkMesh first (most efficient)
+            self.logger.info(f"Running checkMesh -parallel on {phase_name} mesh")
+            check_cmd = ["mpirun", "-np", str(n_procs), "checkMesh", "-parallel"]
+            try:
+                res = run_command(check_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
+                output_text = res.stdout + res.stderr
+                (logs / f"log.checkMesh.{phase_name}").write_text(output_text)
+                metrics = self._parse_parallel_checkmesh(output_text)
+                
+                # Only reconstruct if we need serial fallback AND it's the final phase
+                if not metrics.get("meshOK", False) and phase_name == "layers":
+                    self.logger.info("Parallel checkMesh indicated issues, reconstructing for detailed analysis")
+                    try:
+                        res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
+                        (logs / f"log.reconstruct.{phase_name}").write_text(res.stdout + res.stderr)
+                        serial_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
+                        # Use more detailed serial metrics if available
+                        return serial_metrics if serial_metrics.get("meshOK", False) != metrics.get("meshOK", False) else metrics
+                    except Exception as e:
+                        self.logger.warning(f"Reconstruction failed: {e}")
+                        return metrics
+                else:
+                    return metrics
+                    
+            except Exception as e:
+                self.logger.warning(f"Parallel checkMesh failed: {e}")
+                # Only now do we reconstruct for serial fallback
+                try:
+                    self.logger.info("Reconstructing for serial checkMesh fallback")
+                    res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
+                    (logs / f"log.reconstruct.{phase_name}").write_text(res.stdout + res.stderr)
+                    return check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
+                except Exception as serial_e:
+                    self.logger.error(f"Serial checkMesh fallback failed: {serial_e}")
+                    return {"meshOK": False, "cells": 0}
+        else:
+            # Serial workflow is straightforward
+            return check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
+    
+    def _openfoam_memory_model(self, available_gb, n_procs):
+        """OpenFOAM-specific memory usage model for accurate cell budgeting"""
+        # OpenFOAM memory usage patterns (empirically derived):
+        # - Basic cell storage: ~1.5KB/cell (coordinates, connectivity)
+        # - Gradient calculations: ~0.8KB/cell (grad(p), grad(U), etc.)
+        # - Linear solver workspace: ~0.5KB/cell (matrix assembly)
+        # - Parallel overhead: ~0.2KB/cell per processor
+        
+        base_memory_per_cell = 1.5e-3  # GB per cell
+        gradient_overhead = 0.8e-3     # GB per cell for gradient calculations
+        solver_workspace = 0.5e-3      # GB per cell for linear solver
+        parallel_overhead = 0.2e-3 * n_procs  # Increases with processor count
+        
+        total_memory_per_cell = base_memory_per_cell + gradient_overhead + solver_workspace + parallel_overhead
+        
+        # Add safety factor for snappyHexMesh (higher memory usage during meshing)
+        snappy_factor = 1.3  # 30% extra during mesh generation
+        effective_memory_per_cell = total_memory_per_cell * snappy_factor
+        
+        # Calculate maximum cells based on available memory
+        max_cells = int(available_gb / effective_memory_per_cell)
+        
+        # Apply practical limits based on OpenFOAM performance characteristics
+        if n_procs == 1:
+            # Serial runs: avoid excessive memory pressure
+            max_cells = min(max_cells, 2_000_000)
+        else:
+            # Parallel runs: higher limits but bound by inter-processor communication
+            max_cells = min(max_cells, 10_000_000)
+            
+        self.logger.debug(f"OpenFOAM memory breakdown: {effective_memory_per_cell*1000:.2f}KB/cell "
+                         f"(base={base_memory_per_cell*1000:.1f}, grad={gradient_overhead*1000:.1f}, "
+                         f"solver={solver_workspace*1000:.1f}, parallel={parallel_overhead*1000:.1f})")
+        
+        return max_cells
+    
+    def _validate_feature_resolution(self, feature_size, cell_size):
+        """Validate that important geometric features are adequately resolved"""
+        if feature_size <= 0 or cell_size <= 0:
+            return True  # Skip validation for invalid inputs
+            
+        resolution_ratio = feature_size / cell_size
+        
+        # CFD best practices: minimum 3-4 cells across important features
+        min_cells_across = 3.0
+        adequate_resolution = resolution_ratio >= min_cells_across
+        
+        if not adequate_resolution:
+            self.logger.warning(f"Feature under-resolved: {resolution_ratio:.1f} cells across "
+                              f"(need ≥{min_cells_across:.1f} for accurate flow representation)")
+            
+            # Suggest refinement level increase
+            recommended_refinement = int(np.ceil(np.log2(min_cells_across / resolution_ratio)))
+            if recommended_refinement > 0:
+                self.logger.info(f"Consider increasing surface refinement by {recommended_refinement} level(s)")
+        else:
+            self.logger.debug(f"Feature well-resolved: {resolution_ratio:.1f} cells across")
+            
+        return adequate_resolution
+    
+    def _estimate_minimum_feature_size(self, stl_path):
+        """Estimate minimum geometric feature size from STL surface"""
+        try:
+            if not stl_path.exists():
+                return 0.0
+                
+            vertices = self._read_stl_vertices(stl_path)
+            if len(vertices) < 6:  # Need at least 2 triangles
+                return 0.0
+            
+            # Calculate edge lengths between consecutive vertices
+            edge_lengths = []
+            for i in range(0, len(vertices) - 3, 3):  # Process triangles
+                triangle = vertices[i:i+3]
+                for j in range(3):
+                    v1, v2 = triangle[j], triangle[(j+1) % 3]
+                    edge_length = np.sqrt(sum((v2[k] - v1[k])**2 for k in range(3)))
+                    if edge_length > 1e-12:  # Avoid degenerate edges
+                        edge_lengths.append(edge_length)
+            
+            if not edge_lengths:
+                return 0.0
+                
+            # Use 10th percentile as minimum feature size (robust against outliers)
+            min_feature = np.percentile(edge_lengths, 10)
+            self.logger.debug(f"Estimated minimum feature size: {min_feature:.6f}m from {len(edge_lengths)} edges")
+            
+            return min_feature
+            
+        except Exception as e:
+            self.logger.debug(f"Feature size estimation failed: {e}")
+            return 0.0
+    
+    def _mesh_convergence_check(self, current_metrics):
+        """Check if mesh quality metrics have converged"""
+        if not current_metrics or not isinstance(current_metrics, dict):
+            return False
+            
+        # Add current iteration to history
+        quality_entry = {
+            'iteration': self.current_iteration,
+            'maxNonOrtho': current_metrics.get('maxNonOrtho', 999),
+            'maxSkewness': current_metrics.get('maxSkewness', 999),
+            'cells': current_metrics.get('cells', 0),
+            'meshOK': current_metrics.get('meshOK', False)
+        }
+        self.quality_history.append(quality_entry)
+        
+        # Need at least 3 iterations to assess convergence
+        if len(self.quality_history) < 3:
+            return False
+        
+        # Extract last 3 iterations
+        recent_history = self.quality_history[-3:]
+        
+        # Check convergence of key quality metrics
+        nonortho_values = [entry['maxNonOrtho'] for entry in recent_history]
+        skewness_values = [entry['maxSkewness'] for entry in recent_history]
+        cell_counts = [entry['cells'] for entry in recent_history]
+        
+        # Calculate coefficient of variation (std/mean) for stability assessment
+        def coeff_variation(values):
+            if len(values) < 2 or np.mean(values) == 0:
+                return 999  # High variation for edge cases
+            return np.std(values) / np.mean(values)
+        
+        nonortho_cv = coeff_variation(nonortho_values)
+        skewness_cv = coeff_variation(skewness_values)
+        cells_cv = coeff_variation(cell_counts)
+        
+        # Convergence criteria (low coefficient of variation indicates stability)
+        nonortho_converged = nonortho_cv < 0.05  # 5% variation
+        skewness_converged = skewness_cv < 0.05  # 5% variation
+        cells_converged = cells_cv < 0.10        # 10% variation (cell count can vary more)
+        
+        overall_converged = nonortho_converged and skewness_converged and cells_converged
+        
+        if overall_converged:
+            recent_avg_nonortho = np.mean(nonortho_values)
+            recent_avg_skewness = np.mean(skewness_values)
+            recent_avg_cells = int(np.mean(cell_counts))
+            
+            self.logger.info(f"Mesh quality converged: maxNonOrtho={recent_avg_nonortho:.1f}±{nonortho_cv*100:.1f}%, "
+                           f"maxSkewness={recent_avg_skewness:.2f}±{skewness_cv*100:.1f}%, "
+                           f"cells={recent_avg_cells:,}±{cells_cv*100:.1f}%")
+        else:
+            self.logger.debug(f"Convergence check: nonortho_cv={nonortho_cv:.3f}, "
+                            f"skewness_cv={skewness_cv:.3f}, cells_cv={cells_cv:.3f}")
+        
+        return overall_converged
 
     def _bbox_maxdim_py(self, stl_path: Path) -> float:
         """Max bbox dimension in RAW STL coordinates (no unit conversion) for unit detection."""
@@ -1472,8 +1728,9 @@ runTimeModifiable true;
         if m:
             metrics["cells"] = int(m.group(1))
         
-        # success flag: tolerate punctuation/duplication
-        metrics["meshOK"] = ("Mesh OK" in output) or ("Mesh OK." in output)
+        # success flag: robust case-insensitive parsing for different OpenFOAM builds
+        low = output.lower()
+        metrics["meshOK"] = "mesh ok" in low
         
         # don't try to scrape wall faces from the text here; we'll compute it from boundary files
         return metrics
@@ -1565,10 +1822,10 @@ includedAngle   {included_angle:.1f};  // curvature-adaptive feature detection
             mu = float(self.physics.get("mu", 3.5e-3))             # Pa·s
             hr_hz = float(self.physics.get("heart_rate_hz", 1.2))  # Hz
             
-            # Calculate Womersley boundary layer thickness δ_W ~ sqrt(ν / ω)
+            # Calculate Womersley boundary layer thickness δ_W = sqrt(2ν / ω)
             nu = mu / rho                                          # m²/s
             omega = 2.0 * np.pi * hr_hz                           # rad/s
-            delta_w = np.sqrt(nu / omega)                         # Womersley BL thickness
+            delta_w = np.sqrt(2.0 * nu / omega)                   # Womersley BL thickness (corrected)
             
             # Near band: 2-4 δ_W, far band: 10-20 δ_W
             near_dist = 3.0 * delta_w
@@ -1627,6 +1884,7 @@ castellatedMeshControls
             file "inlet.eMesh";
             level {self.surface_levels[0]};
         }}
+{chr(10).join(f'        {{ file "{n}.eMesh"; level {self.surface_levels[0]}; }}' for n in outlet_names)}
     );
     
     refinementSurfaces
@@ -1736,6 +1994,15 @@ mergeTolerance 1e-6;
     def _snappy_layers_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
         L = self.config["LAYERS"].copy()  # Make a copy to avoid modifying config
         
+        # Apply critical layer validation to the copy
+        L.setdefault("firstLayerThickness_abs", 50e-6)
+        L.setdefault("minThickness_abs", 20e-6)
+        
+        # CRITICAL FIX: Ensure minThickness = 0.15 × firstLayerThickness (CFD best practice)
+        if L["minThickness_abs"] > L["firstLayerThickness_abs"] * 0.2:
+            L["minThickness_abs"] = L["firstLayerThickness_abs"] * 0.15  # 0.1-0.2 range, use 0.15
+            self.logger.warning(f"Fixed minThickness: {L['minThickness_abs']*1e6:.2f}μm = 0.15×firstLayer ({L['firstLayerThickness_abs']*1e6:.2f}μm)")
+        
         # Auto-size layers if enabled (default behavior)
         auto_sizing = self.stage1.get("autoFirstLayerFromDx", True)
         if auto_sizing:
@@ -1746,6 +2013,11 @@ mergeTolerance 1e-6;
             # Apply auto-sizing (will adjust N if clamping occurs)
             sizing = self._first_layer_from_dx(dx_base, N, ER, alpha)
             L.update(sizing)  # This now includes adjusted nSurfaceLayers
+            
+            # CRITICAL: Re-validate after auto-sizing overwrites values
+            if L["minThickness_abs"] > L["firstLayerThickness_abs"] * 0.2:
+                L["minThickness_abs"] = L["firstLayerThickness_abs"] * 0.15
+                self.logger.warning(f"Auto-sizing created invalid minThickness - fixed: {L['minThickness_abs']*1e6:.2f}μm")
             
             # Use the potentially adjusted N for logging
             N_actual = sizing.get('nSurfaceLayers', N)
@@ -1775,6 +2047,11 @@ mergeTolerance 1e-6;
                 L["nSurfaceLayers"] = min(L.get("nSurfaceLayers", 10), 12)
                 L["expansionRatio"] = max(L.get("expansionRatio", 1.2), 1.2)
             
+            # CRITICAL: Re-validate after physics-aware sizing
+            if L["minThickness_abs"] > L["firstLayerThickness_abs"] * 0.2:
+                L["minThickness_abs"] = L["firstLayerThickness_abs"] * 0.15
+                self.logger.warning(f"Physics sizing created invalid minThickness - fixed: {L['minThickness_abs']*1e6:.2f}μm")
+            
             self.logger.info(f"Auto first layer: {L['firstLayerThickness_abs']*1e6:.1f} μm for y+={y_plus}, {model} flow")
         
         # Sync effective layer parameters back to config for metrics consistency
@@ -1783,10 +2060,10 @@ mergeTolerance 1e-6;
             "expansionRatio": L["expansionRatio"],
             "firstLayerThickness_abs": L.get("firstLayerThickness_abs", 50e-6),
             "minThickness_abs": L.get("minThickness_abs", 20e-6),
-            "nGrow": L.get("nGrow", 0),
-            "featureAngle": L.get("featureAngle", 60),
-            "maxThicknessToMedialRatio": L.get("maxThicknessToMedialRatio", 0.3),
-            "minMedianAxisAngle": L.get("minMedianAxisAngle", 90),
+            "nGrow": L.get("nGrow", 1),
+            "featureAngle": L.get("featureAngle", 70),
+            "maxThicknessToMedialRatio": L.get("maxThicknessToMedialRatio", 0.45),
+            "minMedianAxisAngle": L.get("minMedianAxisAngle", 70),
         })
         
         content = f"""/*--------------------------------*- C++ -*----------------------------------*\\
@@ -1852,15 +2129,15 @@ addLayersControls
     firstLayerThickness {L.get("firstLayerThickness_abs", 50e-6):.2e};
     expansionRatio {L["expansionRatio"]};
     minThickness {L.get("minThickness_abs", 20e-6):.2e};
-    nGrow {L.get("nGrow", 0)};
-    featureAngle {min(L.get("featureAngle",60), 90)};
-    nRelaxIter 5;
+    nGrow {L.get("nGrow", 1)};
+    featureAngle {min(L.get("featureAngle",70), 90)};
+    nRelaxIter 8;
     nSmoothSurfaceNormals 3;
     nSmoothNormals 5;
     nSmoothThickness 10;
     maxFaceThicknessRatio 0.5;
-    maxThicknessToMedialRatio {L.get("maxThicknessToMedialRatio",0.3)};
-    minMedianAxisAngle {L.get("minMedianAxisAngle",90)};
+    maxThicknessToMedialRatio {L.get("maxThicknessToMedialRatio",0.45)};
+    minMedianAxisAngle {L.get("minMedianAxisAngle",70)};
     nBufferCellsNoExtrude 0;
     nLayerIter 50;
     nRelaxedIter 20;
@@ -2081,20 +2358,10 @@ method          scotch;
             mesh_generation_ok = True
             self.logger.debug(f"Mesh generation verified via boundary files: {wall_faces_total} wall faces")
         
-        # Always reconstruct after castellation for parallel runs (removes catch-22)
+        # Optimized parallel workflow - minimize reconstruction cycles
+        reconstruction_needed = False
         if n_procs > 1:
-            try:
-                self.logger.info("Reconstructing mesh (post-castellation) to enable serial checkMesh")
-                res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                (logs / "log.reconstruct.no_layers").write_text(res.stdout + res.stderr)
-                
-                # Serial checkMesh now for more reliable parsing
-                castellation_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
-                castellated_ok = castellation_metrics.get("meshOK", False)
-                self.logger.debug(f"Serial checkMesh after reconstruct: meshOK={castellated_ok}")
-                
-            except Exception as e:
-                self.logger.warning(f"Reconstruct/checkMesh (serial) after castellation failed: {e}")
+            self.logger.debug("Parallel workflow - deferring reconstruction until necessary")
         
         if not mesh_generation_ok:
             self.logger.warning("Mesh generation not verified; skipping layers")
@@ -2102,35 +2369,8 @@ method          scotch;
             empty_metrics = {"meshOK": False, "cells": 0}
             return empty_metrics, empty_metrics, empty_metrics
         
-        # Check combined mesh quality (castellation + snap)
-        if n_procs > 1:
-            self.logger.info("Running checkMesh -parallel on generated mesh")
-            check_cmd = ["mpirun", "-np", str(n_procs), "checkMesh", "-parallel"]
-            try:
-                res = run_command(check_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                output_text = res.stdout + res.stderr
-                (logs / "log.checkMesh.no_layers").write_text(output_text)
-                snap_metrics = self._parse_parallel_checkmesh(output_text)
-            except Exception as e:
-                self.logger.warning(f"Parallel checkMesh failed: {e}")
-                # Fall back to serial checkMesh on reconstructed mesh
-                try:
-                    self.logger.info("Falling back to serial checkMesh on reconstructed mesh")
-                    snap_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
-                except Exception as serial_e:
-                    self.logger.error(f"Serial checkMesh fallback also failed: {serial_e}")
-                    snap_metrics = {"meshOK": False, "cells": 0}
-        else:
-            snap_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
-        
-        # Reconstruct mesh for analysis (if parallel and generation succeeded)
-        if n_procs > 1 and snap_metrics.get("meshOK", False):
-            self.logger.info("Reconstructing mesh for analysis")
-            try:
-                res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                (logs / "log.reconstruct.no_layers").write_text(res.stdout + res.stderr)
-            except Exception as e:
-                self.logger.warning(f"Mesh reconstruction failed: {e}")
+        # Optimized mesh quality assessment - avoid premature reconstruction
+        snap_metrics = self._optimized_quality_check(iter_dir, n_procs, env, logs, "no_layers")
         
         # Check for catastrophic mesh failure (zero cells) - only skip layers for complete failure
         cell_count = snap_metrics.get("cells", 0)
@@ -2168,32 +2408,8 @@ method          scotch;
         # Parse layer coverage from snappyHexMesh log
         layer_cov = parse_layer_coverage(iter_dir, env, wall_name=self.wall_name)
         
-        # Check final mesh quality - in parallel if still decomposed
-        if n_procs > 1:
-            # Run checkMesh in parallel mode
-            self.logger.info("Running final checkMesh -parallel on decomposed mesh")
-            check_cmd = ["mpirun", "-np", str(n_procs), "checkMesh", "-parallel"]
-            try:
-                res = run_command(check_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                output_text = res.stdout + res.stderr
-                (logs / "log.checkMesh.layers").write_text(output_text)
-                
-                # Parse the checkMesh output
-                layer_metrics = self._parse_parallel_checkmesh(output_text)
-                self.logger.debug(f"Parsed layer metrics: meshOK={layer_metrics.get('meshOK')}, cells={layer_metrics.get('cells')}")
-                
-            except Exception as e:
-                self.logger.error(f"Final parallel checkMesh failed: {e}")
-                # Try to read from log file if it exists
-                log_file = logs / "log.checkMesh.layers"
-                if log_file.exists():
-                    self.logger.info("Attempting to parse final checkMesh from written log file")
-                    layer_metrics = self._parse_parallel_checkmesh(log_file.read_text())
-                else:
-                    layer_metrics = {"meshOK": False, "cells": 0}
-        else:
-            # Serial checkMesh for non-parallel runs
-            layer_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
+        # Optimized final mesh quality check
+        layer_metrics = self._optimized_quality_check(iter_dir, n_procs, env, logs, "layers")
         
         # Now reconstruct after all checks are done
         if post and n_procs > 1:
@@ -2329,14 +2545,46 @@ method          scotch;
             
             dx = self._derive_base_cell_size(D_ref, D_min)
             
+            # Apply adaptive resolveFeatureAngle based on scaled geometry
+            try:
+                n_out = len(outlet_names)
+                adaptive_angle = self._adaptive_feature_angle(D_ref, D_min, n_outlets=n_out, iter_dir=iter_dir)
+                self.config["SNAPPY"]["resolveFeatureAngle"] = adaptive_angle
+                self.logger.info(f"Applied adaptive resolveFeatureAngle={adaptive_angle}° for iteration {k}")
+            except Exception as e:
+                self.logger.warning(f"Adaptive feature angle failed; keeping {self.config['SNAPPY'].get('resolveFeatureAngle', 35)}°: {e}")
+            
             # 3) Now write blockMesh/snappy dicts using the bbox_data & dx
             self._generate_blockmesh_dict(iter_dir, bbox_data, dx)
+            
+            # Feature resolution validation
+            min_feature_size = self._estimate_minimum_feature_size(iter_dir / "constant" / "triSurface" / f"{self.wall_name}.stl")
+            if min_feature_size > 0:
+                feature_resolved = self._validate_feature_resolution(min_feature_size, dx)
+                if not feature_resolved:
+                    self.logger.info("Feature resolution warning noted - proceeding with current settings")
+            
             self._write_surfaceFeatures(iter_dir, [f"{self.wall_name}.stl", "inlet.stl", *[f"{n}.stl" for n in outlet_names]])
             
-            # Apply ladder progression per iteration (before writing snappy dicts)
-            ladder = self.stage1.get("ladder", [[1,1],[2,2],[2,3]])
-            idx = min(self.current_iteration-1, len(ladder)-1)
-            new_surface_levels = list(ladder[idx])
+            # Apply ladder progression per iteration with curvature adaptation
+            base_ladder = self.stage1.get("ladder", [[1,1],[2,2],[2,3]])
+            idx = min(self.current_iteration-1, len(base_ladder)-1)
+            base_levels = list(base_ladder[idx])
+            
+            # Curvature-adaptive refinement enhancement
+            wall_stl = iter_dir / "constant" / "triSurface" / f"{self.wall_name}.stl"
+            if wall_stl.exists():
+                try:
+                    cs = self._estimate_curvature_strength(wall_stl)
+                    curvature_strength = cs["strength"]
+                    adapted_levels = self._curvature_adaptive_levels(base_levels, curvature_strength)
+                    self.logger.info(f"Curvature adaptation: base={base_levels} → adapted={adapted_levels} (strength={curvature_strength:.3f})")
+                    new_surface_levels = adapted_levels
+                except Exception as e:
+                    self.logger.warning(f"Curvature analysis failed, using base ladder: {e}")
+                    new_surface_levels = base_levels
+            else:
+                new_surface_levels = base_levels
             
             # Detect if surface levels changed - if so, need full remesh
             surface_levels_changed = (not hasattr(self, 'surface_levels') or 
@@ -2386,11 +2634,15 @@ method          scotch;
             # Get current feature snap iter for logging (already applied to config earlier)
             current_nFeatureSnapIter = self.config["SNAPPY"].get("nFeatureSnapIter", 20)
 
+            # Check for mesh quality convergence
+            converged = self._mesh_convergence_check(layer_m)
+            
             # Log
             cov = float(layer_cov.get("coverage_overall", 0.0))
             wall_cov = layer_cov.get("perPatch", {}).get(self.wall_name, cov)
             status = "PASS" if constraints_ok else "FAIL"
-            self.logger.info(f"RESULTS: cells={cell_count:,}, maxNonOrtho={layer_m.get('maxNonOrtho',0):.1f}, maxSkewness={layer_m.get('maxSkewness',0):.2f}, wall_cov={wall_cov*100:.1f}% [{status}]")
+            convergence_status = "CONVERGED" if converged else "EVOLVING"
+            self.logger.info(f"RESULTS: cells={cell_count:,}, maxNonOrtho={layer_m.get('maxNonOrtho',0):.1f}, maxSkewness={layer_m.get('maxSkewness',0):.2f}, wall_cov={wall_cov*100:.1f}% [{status}] [{convergence_status}]")
 
             # Calculate deltas for triage
             delta_nonortho = float(layer_m.get("maxNonOrtho", 0)) - float(snap_m.get("maxNonOrtho", 0))
@@ -2449,10 +2701,20 @@ method          scotch;
                 else:
                     self.logger.info(f"CONSTRAINTS MET: iter {k} with {cell_count:,} cells (not better than {best_cell_count:,})")
                 
-                # If we have a valid solution, we can stop (constraint-based approach)
-                # Continue only if we want to try to find a better (smaller) mesh
-                if best_iter is not None and k >= 2:  # Give at least 2 iterations
+                # Early termination conditions
+                should_terminate = False
+                
+                # Convergence-based termination
+                if converged and constraints_ok and k >= 3:  # Need at least 3 iterations for convergence
+                    self.logger.info(f"Mesh quality converged with valid solution - terminating optimization")
+                    should_terminate = True
+                
+                # Constraint-based termination  
+                elif best_iter is not None and k >= 2:  # Give at least 2 iterations
                     self.logger.info(f"Constraint-based optimization complete: best mesh has {best_cell_count:,} cells")
+                    should_terminate = True
+                
+                if should_terminate:
                     break
             else:
                 self.logger.info(f"CONSTRAINTS NOT MET: iter {k} - continuing optimization")

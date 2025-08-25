@@ -75,12 +75,12 @@
     
     "LAYERS": {
       "nSurfaceLayers": 10,
-      "minThickness_abs": 2.0e-5,
+      "minThickness_abs": 5.0e-6,
       "expansionRatio": 1.2,
-      "nGrow": 0,
-      "featureAngle": 60,
-      "maxThicknessToMedialRatio": 0.3,
-      "minMedianAxisAngle": 90
+      "nGrow": 1,
+      "featureAngle": 70,
+      "maxThicknessToMedialRatio": 0.45,
+      "minMedianAxisAngle": 70
     },
     
     "SCALING": {

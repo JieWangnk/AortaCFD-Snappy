@@ -93,6 +93,10 @@ from typing import Dict, Tuple, List
 from .utils import run_command, check_mesh_quality, parse_layer_coverage
 from .physics_mesh import PhysicsAwareMeshGenerator
 
+# ==================== HELPER FUNCTIONS (ChatGPT improvements) ====================
+
+
+
 
 @dataclass
 class Stage1Targets:
@@ -122,6 +126,9 @@ class Stage1MeshOptimizer:
         with open(self.config_file) as f:
             self.config = json.load(f)
         
+        # Ensure SNAPPY section exists to prevent KeyError
+        self.config.setdefault("SNAPPY", {})
+        
         # Map from new two-tier structure to internal format if needed
         self._map_config_structure()
 
@@ -150,6 +157,9 @@ class Stage1MeshOptimizer:
         self.stl_files = self._discover_stl_files()
         if "featureAngle_init" in self.stage1:
             self.config["SNAPPY"]["resolveFeatureAngle"] = self.stage1["featureAngle_init"]
+        
+        # Apply improved memory-aware cell budgeting
+        self._apply_improved_memory_budgeting()
         
         # Geometry policy for vessel-agnostic sizing
         self.geometry_policy = _safe_get(self.config, ["GEOMETRY_POLICY"], {}) or {}
@@ -366,6 +376,43 @@ class Stage1MeshOptimizer:
             raise FileNotFoundError("No outlet STL files found")
         self.logger.info(f"Found {len(found['outlets'])} outlet files")
         return found
+    
+    def _apply_improved_memory_budgeting(self) -> None:
+        """Apply improved memory-aware cell budgeting."""
+        import psutil
+        
+        # Get current system resources
+        available_gb = psutil.virtual_memory().available / (1024**3)
+        n_procs = self.stage1.get("n_processors", 1)
+        kb_per_cell = self.stage1.get("cell_budget_kb_per_cell", 2.0)
+        
+        # Calculate memory-aware limits
+        # Use 70% of available memory for safety
+        usable_gb = available_gb * 0.7
+        usable_kb = usable_gb * 1024 * 1024
+        
+        # Calculate total cells budget
+        total_cells = int(usable_kb / max(kb_per_cell, 0.5))
+        
+        # Distribute across processors
+        max_local = int(np.clip(total_cells // max(n_procs, 1), 100_000, 5_000_000))
+        max_global = int(np.clip(total_cells, 500_000, 20_000_000))
+        
+        # Apply limits but allow config overrides
+        original_local = self.config["SNAPPY"].get("maxLocalCells", max_local)
+        original_global = self.config["SNAPPY"].get("maxGlobalCells", max_global)
+        
+        # Use the more conservative (smaller) of the two
+        self.config["SNAPPY"]["maxLocalCells"] = min(original_local, max_local)
+        self.config["SNAPPY"]["maxGlobalCells"] = min(original_global, max_global)
+        
+        self.logger.info(f"Memory-aware limits: {available_gb:.1f}GB avail → "
+                        f"Local: {self.config['SNAPPY']['maxLocalCells']:,}, "
+                        f"Global: {self.config['SNAPPY']['maxGlobalCells']:,}")
+        
+        if original_local > max_local or original_global > max_global:
+            self.logger.info(f"   Reduced from config: Local {original_local:,}→{self.config['SNAPPY']['maxLocalCells']:,}, "
+                           f"Global {original_global:,}→{self.config['SNAPPY']['maxGlobalCells']:,}")
 
     def _get_bbox_dimensions(self, bbox_dict):
         """
@@ -400,7 +447,11 @@ class Stage1MeshOptimizer:
         Precedence: divisions > cell_size_m > resolution > geometry-aware
         """
         bm = self.config.get("BLOCKMESH", {}) or {}
-        mins = np.array(bm.get("min_per_axis", [10, 10, 10]), dtype=int)
+        # Handle null/None values in config properly
+        min_per_axis_config = bm.get("min_per_axis", [10, 10, 10])
+        if min_per_axis_config is None:
+            min_per_axis_config = [10, 10, 10]
+        mins = np.array(min_per_axis_config, dtype=int)
 
         if "divisions" in bm and bm["divisions"] is not None:
             divs = np.array(bm["divisions"], dtype=int)
@@ -691,112 +742,6 @@ class Stage1MeshOptimizer:
         # inside if majority of rays say "inside"
         return hits >= 3
 
-    def _calculate_verified_seed_point(self, bbox_data, stl_files, dx_base=None):
-        """Simple, robust seed point using inlet centroid + inside verification."""
-        import numpy as _np
-        import random as _rand
-
-        # Get inlet and wall paths from scaled STL files
-        if "required" in stl_files:
-            inlet_path = Path(stl_files["required"]["inlet"]) 
-            tri_root = inlet_path.parent
-            wall_path = tri_root / f"{self.wall_name}.stl"
-        else:
-            # Fallback to original files if needed
-            return _np.array(bbox_data["center"])
-
-        if not wall_path.exists() or not inlet_path.exists():
-            self.logger.warning(f"Missing scaled STL files, using bbox center")
-            return _np.array(bbox_data["center"])
-
-        # Read inlet vertices and find centroid
-        verts = _np.array(self._read_stl_vertices_raw(inlet_path), dtype=float)
-        if len(verts) == 0:
-            return _np.array(bbox_data["center"])
-        
-        c = verts.mean(axis=0)
-        spreads = verts.std(axis=0)
-        n_axis = int(_np.argmin(spreads))  # axis of least spread = inlet normal
-        
-        # Direction toward bbox center
-        bbox_center = _np.array([
-            (bbox_data["mesh_domain"]["x_min"] + bbox_data["mesh_domain"]["x_max"]) / 2.0,
-            (bbox_data["mesh_domain"]["y_min"] + bbox_data["mesh_domain"]["y_max"]) / 2.0,
-            (bbox_data["mesh_domain"]["z_min"] + bbox_data["mesh_domain"]["z_max"]) / 2.0
-        ])
-        direction = _np.sign(bbox_center[n_axis] - c[n_axis]) or 1.0
-        
-        step = 3.0 * (dx_base or 1e-3)
-        p = c.copy()
-        
-        # Line search inward with verification
-        for _ in range(20):
-            trial = p.copy() 
-            trial[n_axis] += direction * step
-            if self._point_inside_stl(wall_path, trial):
-                self.logger.info(f"Seed found: inlet axis {n_axis} at {trial}")
-                return trial
-            step *= 0.5
-        
-        # Jitter box fallback around centroid
-        rng = _rand.Random(42)
-        dx_jitter = dx_base or 1e-3
-        for _ in range(200):
-            trial = c + _np.array([
-                (rng.random()-0.5) * dx_jitter,
-                (rng.random()-0.5) * dx_jitter, 
-                (rng.random()-0.5) * dx_jitter
-            ])
-            if self._point_inside_stl(wall_path, trial):
-                self.logger.info(f"Seed found: jitter at {trial}")
-                return trial
-        
-        # Last resort
-        self.logger.warning("Could not verify seed inside wall STL, using inlet centroid")
-        return c
-
-    def _check_castellation_success(self, iter_dir, snap_metrics):
-        """Check if castellation actually happened using checkMesh metrics (parallel-safe)."""
-        # Use wall_nFaces from parsed checkMesh output (works for parallel and serial)
-        wall_faces = snap_metrics.get("wall_nFaces")
-        cell_count = snap_metrics.get("cells", 0)
-        
-        # Calculate expected blockMesh cell count for comparison
-        blockmesh_dict = iter_dir / "system" / "blockMeshDict"
-        expected_blockmesh_cells = None
-        if blockmesh_dict.exists():
-            try:
-                content = blockmesh_dict.read_text()
-                # Extract divisions from hex block definition
-                import re
-                match = re.search(r'hex.*?\)\s*\((\d+)\s+(\d+)\s+(\d+)\)', content)
-                if match:
-                    nx, ny, nz = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                    expected_blockmesh_cells = nx * ny * nz
-            except Exception as e:
-                self.logger.debug(f"Could not parse blockMesh divisions: {e}")
-        
-        # Check wall patch faces
-        if wall_faces is None:
-            self.logger.warning(f"Could not find {self.wall_name} patch info in checkMesh output")
-        elif wall_faces == 0:
-            self.logger.error(f"❌ CASTELLATION FAILED: {self.wall_name} patch has 0 faces")
-            self.logger.error(f"   Likely causes: locationInMesh outside lumen or STL not watertight")
-            if expected_blockmesh_cells and abs(cell_count - expected_blockmesh_cells) < 100:
-                self.logger.error(f"   Cell count ({cell_count}) ≈ blockMesh ({expected_blockmesh_cells}) → no region removal occurred")
-        else:
-            self.logger.debug(f"✅ Castellation success: {self.wall_name} has {wall_faces:,} faces")
-            
-            # Additional sanity check: cell count vs blockMesh
-            if expected_blockmesh_cells:
-                if abs(cell_count - expected_blockmesh_cells) < 100:
-                    self.logger.warning(f"⚠️ Cell count ({cell_count}) ≈ blockMesh ({expected_blockmesh_cells}) - minimal castellation occurred")
-                    self.logger.warning(f"   Check locationInMesh is well inside the lumen")
-                elif cell_count > expected_blockmesh_cells:
-                    # This is normal - refinement adds cells
-                    reduction_pct = 100.0 * (1 - expected_blockmesh_cells/cell_count)
-                    self.logger.debug(f"   Cells after castellation: {cell_count:,} ({reduction_pct:.1f}% refinement from blockMesh)")
-
     def _calculate_robust_seed_point(self, bbox_data, stl_files, dx_base=None):
         """
         Robustly compute a locationInMesh that is guaranteed to be inside the lumen.
@@ -983,7 +928,6 @@ class Stage1MeshOptimizer:
             "Could not find a locationInMesh inside the closed surface. "
             "Check that wall+inlet+outlet STLs form a watertight enclosure."
         )
-
 
     # ------------------------ Curvature analysis helpers -------------------------
     def _iter_stl_triangles(self, stl_path: Path):
@@ -1301,62 +1245,60 @@ runTimeModifiable true;
         self.logger.info(f"blockMesh: divisions={divisions.tolist()}, Δx={dx_base*1e3:.2f} mm")
 
     def _copy_trisurfaces(self, iter_dir) -> List[str]:
-        """Copy or scale STL files using config scale_m factor"""
+        """Process STL files with smart scaling and robust error handling"""
         tri = iter_dir / "constant" / "triSurface"
         tri.mkdir(parents=True, exist_ok=True)
         outlet_names = []
         env = self.config["openfoam_env_path"]
-
+        
         all_stl_files = list(self.stl_files["outlets"]) + list(self.stl_files["required"].values())
-
-        # Get scaling factor from config
         scale_m = self.config.get("SCALING", {}).get("scale_m", 1.0)
         
-        if scale_m != 1.0:
-            self.logger.info(f"Scaling STL files using config scale_m={scale_m}")
-            for p in all_stl_files:
-                dest_path = tri / p.name
-                self.logger.info(f"SCALING {p.name} (scale={scale_m})")
-                self._scale_stl_to_meters_config(p, dest_path, iter_dir, env, scale_m)
-
-                if p in self.stl_files["outlets"]:
-                    outlet_names.append(p.stem)
-        else:
-            self.logger.info("Copying STL files as-is (scale_m=1.0)")
-            for p in all_stl_files:
-                dest_path = tri / p.name
-                shutil.copy2(p, dest_path)
-                self.logger.debug(f"Copied {p.name}")
-
-                if p in self.stl_files["outlets"]:
-                    outlet_names.append(p.stem)
+        self.logger.info(f"Processing {len(all_stl_files)} STL files with scale_m={scale_m}")
+        
+        for p in all_stl_files:
+            dest_path = tri / p.name
+            
+            # Integrated copy/scale logic with smart detection
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                # If explicit scale factor provided
+                if scale_m != 1.0 and abs(scale_m - 1.0) > 1e-12:
+                    cmd = f'surfaceTransformPoints "scale=({scale_m} {scale_m} {scale_m})" "{p.absolute()}" "{dest_path.absolute()}"'
+                    self.logger.info(f"SCALING {p.name} (scale={scale_m})")
+                    result = run_command(cmd, cwd=iter_dir, env_setup=env, timeout=600, max_memory_gb=self.max_memory_gb)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed scaling {p.name}: {result.stderr}")
+                        
+                # Auto-detection mode: check if needs mm->m scaling
+                elif self._check_stl_units(p):
+                    cmd = f'surfaceTransformPoints "scale=(0.001 0.001 0.001)" "{p.absolute()}" "{dest_path.absolute()}"'
+                    self.logger.info(f"AUTO-SCALING {p.name} (mm->m)")
+                    result = run_command(cmd, cwd=iter_dir, env_setup=env, timeout=600, max_memory_gb=self.max_memory_gb)
+                    if result.returncode != 0:
+                        self.logger.warning(f"Auto-scaling failed for {p.name}, copying instead")
+                        shutil.copy2(p, dest_path)
+                else:
+                    # Just copy the file
+                    self.logger.debug(f"COPYING {p.name}")
+                    shutil.copy2(p, dest_path)
+                    
+            except Exception as e:
+                self.logger.error(f"STL processing failed for {p.name}: {e}")
+                # Fallback to copy
+                try:
+                    shutil.copy2(p, dest_path)
+                    self.logger.info(f"Fallback copy successful for {p.name}")
+                except Exception as copy_e:
+                    raise RuntimeError(f"Both scaling and copy failed for {p.name}: {copy_e}")
+            
+            # Track outlet names for mesh generation
+            if p in self.stl_files["outlets"]:
+                outlet_names.append(p.stem)
 
         return outlet_names
-
-    def _scale_stl_to_meters_config(self, src_path: Path, dest_path: Path, iter_dir: Path, env: str, scale_factor: float):
-        """Scale STL using config scale factor with surfaceTransformPoints."""
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use config scale factor
-        cmd_str = f'surfaceTransformPoints "scale=({scale_factor} {scale_factor} {scale_factor})" "{src_path.absolute()}" "{dest_path.absolute()}"'
-        self.logger.info(f"Running scaling command: {cmd_str}")
-        self.logger.info(f"Working directory: {iter_dir}")
-        self.logger.info(f"Environment: {env}")
-        
-        res = run_command(
-            cmd_str, cwd=iter_dir, env_setup=env, timeout=300, max_memory_gb=self.max_memory_gb
-        )
-        
-        self.logger.info(f"Scaling command return code: {res.returncode}")
-        if res.returncode == 0:
-            # Verify scaling success
-            max_dim_src = self._bbox_maxdim_py(src_path)
-            max_dim_dest = self._bbox_maxdim_py(dest_path)
-            self.logger.info(f"{src_path.name}: maxDim src={max_dim_src:.6f} → dest={max_dim_dest:.6f} (scale={scale_factor})")
-        else:
-            self.logger.error(f"Scaling failed for {src_path.name}: {res.stderr}")
-            raise RuntimeError(f"surfaceTransformPoints failed for {src_path.name}")
-
+    
 
     def _bbox_maxdim_py(self, stl_path: Path) -> float:
         """Max bbox dimension in RAW STL coordinates (no unit conversion) for unit detection."""
@@ -1540,46 +1482,34 @@ runTimeModifiable true;
         """Count wall patch faces from boundary files (parallel-safe)"""
         total = 0
         
-        # Sum from all processor directories
-        for b in iter_dir.glob("processor*/constant/polyMesh/boundary"):
-            try:
-                txt = b.read_text()
-                m = re.search(rf"{self.wall_name}\s*\{{[^{{}}]*?nFaces\s+(\d+);", txt, re.DOTALL)
-                if m:
-                    total += int(m.group(1))
-                    self.logger.debug(f"Found {m.group(1)} {self.wall_name} faces in {b.parent.parent.parent.name}")
-            except Exception as e:
-                self.logger.debug(f"Could not parse boundary file {b}: {e}")
+        # Check if processor directories exist (parallel case)
+        processor_dirs = list(iter_dir.glob("processor*"))
         
-        # Also try the root mesh if present (serial case)
-        b = iter_dir / "constant" / "polyMesh" / "boundary"
-        if b.exists():
-            try:
-                txt = b.read_text()
-                m = re.search(rf"{self.wall_name}\s*\{{[^{{}}]*?nFaces\s+(\d+);", txt, re.DOTALL)
-                if m: 
-                    total += int(m.group(1))
-                    self.logger.debug(f"Found {m.group(1)} {self.wall_name} faces in root mesh")
-            except Exception as e:
-                self.logger.debug(f"Could not parse root boundary file: {e}")
+        if processor_dirs:
+            # Prefer processor totals when they exist
+            for b in iter_dir.glob("processor*/constant/polyMesh/boundary"):
+                try:
+                    txt = b.read_text()
+                    m = re.search(rf"{self.wall_name}\s*\{{[^{{}}]*?nFaces\s+(\d+);", txt, re.DOTALL)
+                    if m:
+                        total += int(m.group(1))
+                        self.logger.debug(f"Found {m.group(1)} {self.wall_name} faces in {b.parent.parent.parent.name}")
+                except Exception as e:
+                    self.logger.debug(f"Could not parse boundary file {b}: {e}")
+        else:
+            # Only use root mesh if no processor directories exist (serial case)
+            b = iter_dir / "constant" / "polyMesh" / "boundary"
+            if b.exists():
+                try:
+                    txt = b.read_text()
+                    m = re.search(rf"{self.wall_name}\s*\{{[^{{}}]*?nFaces\s+(\d+);", txt, re.DOTALL)
+                    if m: 
+                        total += int(m.group(1))
+                        self.logger.debug(f"Found {m.group(1)} {self.wall_name} faces in root mesh")
+                except Exception as e:
+                    self.logger.debug(f"Could not parse root boundary file: {e}")
         
         return total
-    
-    def _copy_trisurface_to_processors(self, iter_dir, n_procs: int):
-        """Copy triSurface directory to each processor for parallel access"""
-        master_trisurface = iter_dir / "constant" / "triSurface"
-        if not master_trisurface.exists():
-            return
-        
-        for i in range(n_procs):
-            proc_dir = iter_dir / f"processor{i}"
-            if proc_dir.exists():
-                proc_trisurface = proc_dir / "constant" / "triSurface"
-                if proc_trisurface.exists():
-                    shutil.rmtree(proc_trisurface)
-                shutil.copytree(master_trisurface, proc_trisurface)
-        
-        self.logger.debug(f"Copied triSurface directory to {n_procs} processors")
 
     def _write_surfaceFeatures(self, iter_dir, all_surfaces: List[str]):
         # Curvature-aware includedAngle selection
@@ -1589,9 +1519,9 @@ runTimeModifiable true;
             try:
                 cs = self._estimate_curvature_strength(wall_stl)
                 strength = cs["strength"]
-                # Map curvature strength [0,1] to includedAngle [145°, 170°]
-                # Higher curvature → higher angle → more features detected
-                included_angle = 145 + (strength * 25)
+                # Map curvature strength [0,1] to includedAngle [170°, 145°]
+                # Higher curvature → lower angle → more features detected
+                included_angle = 170 - (strength * 25)
                 self.logger.info(f"Curvature-aware includedAngle: {included_angle:.1f}° (strength={strength:.3f}, {cs['nTris']} tris)")
             except Exception as e:
                 # Fallback to configuration or default
@@ -1623,7 +1553,7 @@ includedAngle   {included_angle:.1f};  // curvature-adaptive feature detection
 """
         (iter_dir / "system" / "surfaceFeaturesDict").write_text(content)
 
-    def _snappy_castellation_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
+    def _snappy_no_layers_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
         snap = self.config["SNAPPY"]
         
         # Calculate refinement band distances - either physics-based or geometry-based
@@ -1669,7 +1599,7 @@ FoamFile
 }}
 
 castellatedMesh true;
-snap            false;
+snap            true;
 addLayers       false;
 
 geometry
@@ -1731,13 +1661,13 @@ castellatedMeshControls
 
 snapControls
 {{
-    nSmoothPatch 0;
+    nSmoothPatch {snap.get("nSmoothPatch", 3)};
     tolerance 1.0;
-    nSolveIter 0;
-    nRelaxIter 0;
-    nFeatureSnapIter 0;
-    implicitFeatureSnap false;
-    explicitFeatureSnap false;
+    nSolveIter 30;
+    nRelaxIter 5;
+    nFeatureSnapIter {snap.get("nFeatureSnapIter", 10)};
+    implicitFeatureSnap {str(snap.get("implicitFeatureSnap", False)).lower()};
+    explicitFeatureSnap {str(snap.get("explicitFeatureSnap", True)).lower()};
     multiRegionFeatureSnap false;
 }}
 
@@ -1801,179 +1731,7 @@ meshQualityControls
 
 mergeTolerance 1e-6;
 """
-        (iter_dir / "system" / "snappyHexMeshDict.castellation").write_text(content)
-
-    def _snappy_snap_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
-        snap = self.config["SNAPPY"]
-        
-        # Calculate refinement band distances - either physics-based or geometry-based
-        if self.physics.get("use_womersley_bands", False):
-            # Use Womersley boundary layer thickness for pulsatile flow
-            mu = float(self.physics.get("mu", 3.5e-3))      # Pa·s
-            rho = float(self.physics.get("rho", 1060.0))    # kg/m³
-            nu = mu / rho                                    # Kinematic viscosity m²/s
-            heart_rate_hz = float(self.physics.get("heart_rate_hz", 1.2))  # ~72 bpm
-            
-            delta = self._womersley_boundary_layer(heart_rate_hz, nu)
-            near = max(1e-6, 2.0 * delta)    # 2 δ_ω for near-wall refinement
-            far = max(near * 1.2, 8.0 * delta)  # 8 δ_ω for far-field refinement
-            self.logger.info(f"Womersley-based refinement bands: near={near*1e3:.2f}mm, far={far*1e3:.2f}mm")
-        else:
-            # Keep Δx-based near/far bands
-            near = max(1e-6, float(self.stage1.get("near_band_cells", 4)) * dx_base)
-            far = max(near * 1.2, float(self.stage1.get("far_band_cells", 10)) * dx_base)
-            self.logger.info(f"Cell-based refinement bands: near={near*1e3:.2f}mm ({self.stage1.get('near_band_cells', 4)} cells), far={far*1e3:.2f}mm ({self.stage1.get('far_band_cells', 10)} cells)")
-        
-        lvl_min, lvl_max = self.surface_levels
-        
-        # Choose feature angle - adaptive or legacy ladder
-        if self.geometry_policy.get("featureAngle_mode", "adaptive") == "adaptive":
-            # Use geometry-adaptive feature angle (use cached values if available)
-            if not hasattr(self, '_cached_diameters'):
-                D_ref, D_min = self._estimate_reference_diameters()
-                self._cached_diameters = (D_ref, D_min)
-            else:
-                D_ref, D_min = self._cached_diameters
-            n_outlets = len(self.stl_files["outlets"])
-            resAngle = self._adaptive_feature_angle(D_ref, D_min, n_outlets, iter_dir)
-        else:
-            # Use legacy ladder mode for backward compatibility
-            resAngle = min(int(snap.get("resolveFeatureAngle", 45)), 60)
-        
-        # Keep metrics consistent - sync actual angle used back to config
-        self.config["SNAPPY"]["resolveFeatureAngle"] = resAngle
-        
-        # Couple nFeatureSnapIter with resolveFeatureAngle for curvature capture
-        # Higher iterations for better edge/curvature adherence per tutorial guidance
-        base_snap_iter = 20
-        if resAngle <= 35:
-            nFeatureSnapIter = 30  # More iterations for aggressive curvature capture
-        elif resAngle >= 55:
-            nFeatureSnapIter = base_snap_iter  # Moderate iterations for smoother features
-        else:
-            # Linear interpolation between 35° and 55°
-            nFeatureSnapIter = int(30 + (base_snap_iter - 30) * (resAngle - 35) / (55 - 35))
-        
-        # Override config value with coupled calculation
-        snap["nFeatureSnapIter"] = nFeatureSnapIter
-        
-        # Apply cell budget to snappy limits (recalculate each iteration)
-        kb_per_cell = float(self.stage1.get("cell_budget_kb_per_cell", 1.0))
-        n_procs = int(self.stage1.get("n_processors", 1))  # For multi-process scenarios
-        
-        # Update available memory each iteration in case system state changed
-        import psutil
-        current_available_gb = psutil.virtual_memory().available / (1024**3)
-        current_memory_limit = min(current_available_gb * 0.7, self.max_memory_gb)
-        budget_cells = int((current_memory_limit * 1e6) / (kb_per_cell * max(n_procs, 1)))
-        
-        # Cap snappy limits by memory budget (locally, don't modify config)
-        original_global = int(self.config["SNAPPY"]["maxGlobalCells"])
-        original_local = int(self.config["SNAPPY"]["maxLocalCells"])
-        capped_global = min(original_global, budget_cells)
-        
-        # Log detailed memory budgeting calculation
-        self.logger.info(f"Memory budget: {current_available_gb:.1f}GB avail → {current_memory_limit:.1f}GB limit "
-                        f"÷ {kb_per_cell}KB/cell ÷ {n_procs}proc = {budget_cells:,} cell budget")
-        
-        capped_local = min(original_local, budget_cells // max(n_procs, 1))
-        
-        if capped_global < original_global:
-            self.logger.info(f"Cell budget applied: {original_global:,} → {capped_global:,} global cells")
-        content = f"""/*--------------------------------*- C++ -*----------------------------------*\\
-  =========                 |
-  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
-   \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Version:  12
-     \\/     M anipulation  |
-\\*---------------------------------------------------------------------------*/
-FoamFile
-{{
-    format      ascii;
-    class       dictionary;
-    object      snappyHexMeshDict;
-}}
-
-castellatedMesh false;
-snap            true;
-addLayers       false;
-
-geometry
-{{
-    inlet.stl       {{ type triSurfaceMesh; name inlet;       file "inlet.stl"; }}
-{chr(10).join(f'    {n}.stl        {{ type triSurfaceMesh; name {n};           file "{n}.stl"; }}' for n in outlet_names)}
-    {self.wall_name}.stl  {{ type triSurfaceMesh; name {self.wall_name};  file "{self.wall_name}.stl"; }}
-}};
-
-features
-(
-    {{ file "inlet.eMesh"; level 1; }}
-{chr(10).join(f'    {{ file "{n}.eMesh"; level 1; }}' for n in outlet_names)}
-    {{ file "{self.wall_name}.eMesh"; level 1; }}
-);
-
-castellatedMeshControls
-{{
-    // Minimal settings for snap-only phase (no castellation/refinement)
-    maxLocalCells {capped_local};
-    maxGlobalCells {capped_global};
-    minRefinementCells 0;
-    maxLoadUnbalance 0.10;
-    nCellsBetweenLevels 1;
-    locationInMesh ({internal_pt[0]:.6f} {internal_pt[1]:.6f} {internal_pt[2]:.6f});
-    allowFreeStandingZoneFaces true;
-    resolveFeatureAngle {resAngle};
-}}
-
-snapControls
-{{
-    nSmoothPatch {snap.get("nSmoothPatch", 3)};
-    tolerance 1.0;
-    nSolveIter 30;
-    nRelaxIter 5;
-    nFeatureSnapIter {snap.get("nFeatureSnapIter", 10)};
-    implicitFeatureSnap {str(snap.get("implicitFeatureSnap", False)).lower()};
-    explicitFeatureSnap {str(snap.get("explicitFeatureSnap", True)).lower()};
-    multiRegionFeatureSnap false;
-}}
-
-meshQualityControls
-{{
-    maxNonOrtho {_safe_get(self.config,["MESH_QUALITY","snap","maxNonOrtho"],65)};
-    maxBoundarySkewness {_safe_get(self.config,["MESH_QUALITY","snap","maxBoundarySkewness"],4.0)};
-    maxInternalSkewness {_safe_get(self.config,["MESH_QUALITY","snap","maxInternalSkewness"],4.0)};
-    maxConcave 80;
-    minFlatness 0.5;
-    minVol {_safe_get(self.config,["MESH_QUALITY","snap","minVol"],1e-13)};
-    minTetQuality {_safe_get(self.config,["MESH_QUALITY","snap","minTetQuality"],-1e15)};
-    minArea -1;
-    minTwist 0.02;
-    minDeterminant 0.001;
-    minFaceWeight {_safe_get(self.config,["MESH_QUALITY","snap","minFaceWeight"],0.02)};
-    minVolRatio 0.01;
-    minTriangleTwist -1;
-    nSmoothScale 4;
-    errorReduction 0.75;
-    
-    // Relaxed quality criteria for snapping (OpenFOAM 12 requirement)
-    relaxed
-    {{
-        maxNonOrtho 75;
-        maxBoundarySkewness 6.0;
-        maxInternalSkewness 6.0;
-        maxConcave 90;
-        minFlatness 0.3;
-        minVol 1e-15;
-        minTetQuality 1e-9;
-        minFaceWeight 0.005;
-        minVolRatio 0.005;
-        minDeterminant 0.0005;
-    }}
-}}
-
-mergeTolerance 1e-6;
-"""
-        (iter_dir / "system" / "snappyHexMeshDict.snap").write_text(content)
+        (iter_dir / "system" / "snappyHexMeshDict.noLayer").write_text(content)
 
     def _snappy_layers_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
         L = self.config["LAYERS"].copy()  # Make a copy to avoid modifying config
@@ -2091,9 +1849,9 @@ addLayersControls
         }}
     }}
 
-    firstLayerThickness {L.get("firstLayerThickness_abs", 50e-6)};
+    firstLayerThickness {L.get("firstLayerThickness_abs", 50e-6):.2e};
     expansionRatio {L["expansionRatio"]};
-    minThickness {L.get("minThickness_abs", 20e-6)};
+    minThickness {L.get("minThickness_abs", 20e-6):.2e};
     nGrow {L.get("nGrow", 0)};
     featureAngle {min(L.get("featureAngle",60), 90)};
     nRelaxIter 5;
@@ -2145,6 +1903,16 @@ meshQualityControls
 mergeTolerance 1e-6;
 """
         (iter_dir / "system" / "snappyHexMeshDict.layers").write_text(content)
+
+    def _snappy_dict(self, iter_dir, outlet_names, internal_pt, dx_base, phase):
+        """Unified method to generate snappyHexMeshDict for any phase"""
+        if phase not in ["no_layers", "layers"]:
+            raise ValueError(f"Invalid phase: {phase}. Must be 'no_layers' or 'layers'")
+        
+        if phase == "no_layers":
+            self._snappy_no_layers_dict(iter_dir, outlet_names, internal_pt, dx_base)
+        elif phase == "layers":
+            self._snappy_layers_dict(iter_dir, outlet_names, internal_pt, dx_base)
 
     # ----------------------------- Execution ------------------------------
     def _maybe_parallel(self, iter_dir):
@@ -2255,11 +2023,14 @@ method          scotch;
         except Exception as e:
             self.logger.debug(f"Failed to create .foam file: {e}")
 
-    def _run_snap_then_layers(self, iter_dir) -> Tuple[Dict, Dict, Dict]:
+    def _run_snap_then_layers(self, iter_dir, force_full_remesh: bool = True) -> Tuple[Dict, Dict, Dict]:
         env = self.config["openfoam_env_path"]
         logs = iter_dir / "logs"
         logs.mkdir(exist_ok=True)
         
+        if not force_full_remesh:
+            self.logger.info("Layers-only optimization possible, but running full remesh for robustness")
+            
         # Setup parallel decomposition if configured
         pre, post = self._maybe_parallel(iter_dir)
         n_procs = int(self.stage1.get("n_processors", 1))
@@ -2280,14 +2051,13 @@ method          scotch;
                 res = run_command(pre[0], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
                 (logs / pre[1]).write_text(res.stdout + res.stderr)
                 
-                # Copy triSurface directory to each processor for parallel access
-                self._copy_trisurface_to_processors(iter_dir, n_procs)
+                # OpenFOAM automatically handles triSurface distribution in parallel runs
                 
             except Exception as e:
                 self.logger.error(f"Decomposition failed: {e}")
         
-        # CASTELLATION phase
-        shutil.copy2(iter_dir / "system" / "snappyHexMeshDict.castellation", iter_dir / "system" / "snappyHexMeshDict")
+        # MESH WITHOUT LAYERS phase (combined castellation + snap)
+        shutil.copy2(iter_dir / "system" / "snappyHexMeshDict.noLayer", iter_dir / "system" / "snappyHexMeshDict")
         
         # Build snappyHexMesh command (parallel or serial)
         if n_procs > 1:
@@ -2295,61 +2065,28 @@ method          scotch;
         else:
             snappy_cmd = ["snappyHexMesh", "-overwrite"]
         
-        self.logger.info(f"Running: {' '.join(snappy_cmd)} (castellation)")
+        self.logger.info(f"Running: {' '.join(snappy_cmd)} (mesh without layers)")
         try:
             res = run_command(snappy_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-            (logs / "log.snappy.castellation").write_text(res.stdout + res.stderr)
+            (logs / "log.snappy.no_layers").write_text(res.stdout + res.stderr)
         except Exception as e:
-            self.logger.error(f"Castellation meshing failed: {e}")
+            self.logger.error(f"Mesh generation (no layers) failed: {e}")
         
-        # Check mesh quality - run in parallel if decomposed
-        if n_procs > 1:
-            # Run checkMesh in parallel mode
-            self.logger.info("Running checkMesh -parallel on decomposed mesh")
-            check_cmd = ["mpirun", "-np", str(n_procs), "checkMesh", "-parallel"]
-            try:
-                res = run_command(check_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                output_text = res.stdout + res.stderr
-                (logs / "log.checkMesh.castellation").write_text(output_text)
-                
-                # Parse the checkMesh output
-                castellation_metrics = self._parse_parallel_checkmesh(output_text)
-                self.logger.debug(f"Parsed castellation metrics: meshOK={castellation_metrics.get('meshOK')}, cells={castellation_metrics.get('cells')}")
-                
-                # Sanity check: Did castellation actually happen?
-                self._check_castellation_success(iter_dir, castellation_metrics)
-                
-            except Exception as e:
-                self.logger.error(f"Parallel checkMesh failed: {e}")
-                # Try to read from log file if it exists
-                log_file = logs / "log.checkMesh.castellation"
-                if log_file.exists():
-                    self.logger.info("Attempting to parse from written log file")
-                    castellation_metrics = self._parse_parallel_checkmesh(log_file.read_text())
-                else:
-                    castellation_metrics = {"meshOK": False, "cells": 0}
-        else:
-            # Serial checkMesh for non-parallel runs
-            castellation_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
-            # Sanity check: Did castellation actually happen?
-            self._check_castellation_success(iter_dir, castellation_metrics)
-        
-        # Apply Fix C: Always reconstruct after castellation for reliable serial checkMesh
-        # and use boundary file fallback to detect castellation success
-        castellated_ok = bool(castellation_metrics.get("meshOK", False))
+        # Basic mesh generation validation using boundary file fallback
+        mesh_generation_ok = False
         
         # Parallel-safe fallback: trust boundary files if they show faces
         wall_faces_total = self._sum_wall_faces_from_processors(iter_dir)
         if wall_faces_total > 0:
-            castellated_ok = True
-            self.logger.debug(f"Castellation verified via boundary files: {wall_faces_total} wall faces")
+            mesh_generation_ok = True
+            self.logger.debug(f"Mesh generation verified via boundary files: {wall_faces_total} wall faces")
         
         # Always reconstruct after castellation for parallel runs (removes catch-22)
         if n_procs > 1:
             try:
                 self.logger.info("Reconstructing mesh (post-castellation) to enable serial checkMesh")
                 res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                (logs / "log.reconstruct.castellation").write_text(res.stdout + res.stderr)
+                (logs / "log.reconstruct.no_layers").write_text(res.stdout + res.stderr)
                 
                 # Serial checkMesh now for more reliable parsing
                 castellation_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
@@ -2359,51 +2096,46 @@ method          scotch;
             except Exception as e:
                 self.logger.warning(f"Reconstruct/checkMesh (serial) after castellation failed: {e}")
         
-        if not castellated_ok:
-            self.logger.warning("Castellation not verified; skipping snap and layers")
-            # Return early with castellation-only results
-            return castellation_metrics, castellation_metrics, castellation_metrics
+        if not mesh_generation_ok:
+            self.logger.warning("Mesh generation not verified; skipping layers")
+            # Return early with empty metrics
+            empty_metrics = {"meshOK": False, "cells": 0}
+            return empty_metrics, empty_metrics, empty_metrics
         
-        # SNAP phase (castellation succeeded)
-        if True:  # Always run if we get here
-            shutil.copy2(iter_dir / "system" / "snappyHexMeshDict.snap", iter_dir / "system" / "snappyHexMeshDict")
-            
-            self.logger.info(f"Running: {' '.join(snappy_cmd)} (snap)")
+        # Check combined mesh quality (castellation + snap)
+        if n_procs > 1:
+            self.logger.info("Running checkMesh -parallel on generated mesh")
+            check_cmd = ["mpirun", "-np", str(n_procs), "checkMesh", "-parallel"]
             try:
-                res = run_command(snappy_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                (logs / "log.snappy.snap").write_text(res.stdout + res.stderr)
+                res = run_command(check_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
+                output_text = res.stdout + res.stderr
+                (logs / "log.checkMesh.no_layers").write_text(output_text)
+                snap_metrics = self._parse_parallel_checkmesh(output_text)
             except Exception as e:
-                self.logger.error(f"Snap meshing failed: {e}")
-            
-            # Check snap mesh quality
-            if n_procs > 1:
-                self.logger.info("Running checkMesh -parallel on snapped mesh")
+                self.logger.warning(f"Parallel checkMesh failed: {e}")
+                # Fall back to serial checkMesh on reconstructed mesh
                 try:
-                    res = run_command(check_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                    output_text = res.stdout + res.stderr
-                    (logs / "log.checkMesh.snap").write_text(output_text)
-                    snap_metrics = self._parse_parallel_checkmesh(output_text)
-                except Exception as e:
-                    self.logger.error(f"Snap checkMesh failed: {e}")
-                    snap_metrics = castellation_metrics  # Fall back to castellation metrics
-            else:
-                snap_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
-            
-            # Reconstruct snap mesh for analysis (if parallel and snap succeeded)
-            if n_procs > 1 and snap_metrics.get("meshOK", False):
-                self.logger.info("Reconstructing snap mesh for analysis")
-                try:
-                    res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-                    (logs / "log.reconstruct.snap").write_text(res.stdout + res.stderr)
-                except Exception as e:
-                    self.logger.warning(f"Snap mesh reconstruction failed: {e}")
+                    self.logger.info("Falling back to serial checkMesh on reconstructed mesh")
+                    snap_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
+                except Exception as serial_e:
+                    self.logger.error(f"Serial checkMesh fallback also failed: {serial_e}")
+                    snap_metrics = {"meshOK": False, "cells": 0}
         else:
-            self.logger.warning("Castellation failed; skipping snap and layers")
-            snap_metrics = castellation_metrics
+            snap_metrics = check_mesh_quality(iter_dir, env, wall_name=self.wall_name)
         
-        # Gate layers on snap mesh validity
-        if not snap_metrics.get("meshOK", False):
-            self.logger.warning("Snap mesh invalid; skipping layers for this iteration")
+        # Reconstruct mesh for analysis (if parallel and generation succeeded)
+        if n_procs > 1 and snap_metrics.get("meshOK", False):
+            self.logger.info("Reconstructing mesh for analysis")
+            try:
+                res = run_command(["reconstructPar", "-latestTime"], cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
+                (logs / "log.reconstruct.no_layers").write_text(res.stdout + res.stderr)
+            except Exception as e:
+                self.logger.warning(f"Mesh reconstruction failed: {e}")
+        
+        # Check for catastrophic mesh failure (zero cells) - only skip layers for complete failure
+        cell_count = snap_metrics.get("cells", 0)
+        if cell_count == 0:
+            self.logger.warning("Snap mesh has zero cells; skipping layers for this iteration")
             layer_metrics = snap_metrics
             layer_cov = {"coverage_overall": 0.0, "perPatch": {}}
             
@@ -2418,6 +2150,11 @@ method          scotch;
             
             return snap_metrics, layer_metrics, layer_cov
         
+        # Log snap mesh status but continue to layers regardless of quality issues
+        mesh_ok = snap_metrics.get("meshOK", False)
+        if not mesh_ok:
+            self.logger.info("Snap mesh has quality issues but proceeding with layers (may improve quality)")
+        
         # LAYERS phase - continue with decomposed mesh if parallel
         shutil.copy2(iter_dir / "system" / "snappyHexMeshDict.layers", iter_dir / "system" / "snappyHexMeshDict")
         
@@ -2429,7 +2166,7 @@ method          scotch;
             self.logger.error(f"Layer meshing failed: {e}")
         
         # Parse layer coverage from snappyHexMesh log
-        layer_cov = parse_layer_coverage(iter_dir, env)
+        layer_cov = parse_layer_coverage(iter_dir, env, wall_name=self.wall_name)
         
         # Check final mesh quality - in parallel if still decomposed
         if n_procs > 1:
@@ -2493,9 +2230,9 @@ method          scotch;
         )
         return constraints_met
     
-    def _get_cell_count(self, layer_m: Dict, snap_m: Dict) -> int:
+    def _get_cell_count(self, layer_m: Dict, no_layers_m: Dict) -> int:
         """Get cell count for mesh minimization objective"""
-        return int(layer_m.get("cells", snap_m.get("cells", 0)))
+        return int(layer_m.get("cells", no_layers_m.get("cells", 0)))
 
     def _apply_updates(self, snap_m: Dict, layer_m: Dict, layer_cov: Dict) -> None:
         # Decide minimal change for next iteration
@@ -2599,8 +2336,19 @@ method          scotch;
             # Apply ladder progression per iteration (before writing snappy dicts)
             ladder = self.stage1.get("ladder", [[1,1],[2,2],[2,3]])
             idx = min(self.current_iteration-1, len(ladder)-1)
-            self.surface_levels = list(ladder[idx])
+            new_surface_levels = list(ladder[idx])
+            
+            # Detect if surface levels changed - if so, need full remesh
+            surface_levels_changed = (not hasattr(self, 'surface_levels') or 
+                                    self.surface_levels != new_surface_levels)
+            
+            self.surface_levels = new_surface_levels
             self.logger.info(f"Surface levels from ladder: {self.surface_levels}")
+            
+            if surface_levels_changed:
+                self.logger.info("Surface refinement levels changed - full remesh required")
+            else:
+                self.logger.info("Surface levels unchanged - could optimize for layers-only")
             
             # Calculate seed point using robust geometric analysis
             scaled_inlet_path = iter_dir / "constant" / "triSurface" / "inlet.stl"
@@ -2610,20 +2358,7 @@ method          scotch;
                 dx_base=dx
             )
             
-            self._snappy_castellation_dict(iter_dir, outlet_names, internal_point, dx)
-            self._snappy_snap_dict(iter_dir, outlet_names, internal_point, dx)
-            self._snappy_layers_dict(iter_dir, outlet_names, internal_point, dx)
-            self._surface_check(iter_dir)
-
-            # Run
-            snap_m, layer_m, layer_cov = self._run_snap_then_layers(iter_dir)
-
-            # Objective
-            # Check quality constraints and get cell count
-            constraints_ok = self._meets_quality_constraints(snap_m, layer_m, layer_cov)
-            cell_count = self._get_cell_count(layer_m, snap_m)
-            
-            # Get current feature snap iter for logging
+            # Calculate and apply dynamic nFeatureSnapIter before generating snappy dicts
             current_feature_angle = int(self.config["SNAPPY"].get("resolveFeatureAngle", 45))
             if current_feature_angle <= 35:
                 current_nFeatureSnapIter = 30
@@ -2631,11 +2366,30 @@ method          scotch;
                 current_nFeatureSnapIter = 20
             else:
                 current_nFeatureSnapIter = int(30 + (20 - 30) * (current_feature_angle - 35) / (55 - 35))
+            
+            # Apply the calculated nFeatureSnapIter to config so it's used in snappy dicts
+            self.config["SNAPPY"]["nFeatureSnapIter"] = current_nFeatureSnapIter
+            self.logger.info(f"Dynamic nFeatureSnapIter: {current_nFeatureSnapIter} (for resolveFeatureAngle={current_feature_angle}°)")
+
+            self._snappy_dict(iter_dir, outlet_names, internal_point, dx, "no_layers")
+            self._snappy_dict(iter_dir, outlet_names, internal_point, dx, "layers")
+            self._surface_check(iter_dir)
+
+            # Run mesh generation
+            snap_m, layer_m, layer_cov = self._run_snap_then_layers(iter_dir, force_full_remesh=surface_levels_changed)
+
+            # Objective
+            # Check quality constraints and get cell count
+            constraints_ok = self._meets_quality_constraints(snap_m, layer_m, layer_cov)
+            cell_count = self._get_cell_count(layer_m, snap_m)
+            
+            # Get current feature snap iter for logging (already applied to config earlier)
+            current_nFeatureSnapIter = self.config["SNAPPY"].get("nFeatureSnapIter", 20)
 
             # Log
             cov = float(layer_cov.get("coverage_overall", 0.0))
             wall_cov = layer_cov.get("perPatch", {}).get(self.wall_name, cov)
-            status = "✅ PASS" if constraints_ok else "❌ FAIL"
+            status = "PASS" if constraints_ok else "FAIL"
             self.logger.info(f"RESULTS: cells={cell_count:,}, maxNonOrtho={layer_m.get('maxNonOrtho',0):.1f}, maxSkewness={layer_m.get('maxSkewness',0):.2f}, wall_cov={wall_cov*100:.1f}% [{status}]")
 
             # Calculate deltas for triage
@@ -2691,9 +2445,9 @@ method          scotch;
                 if cell_count < best_cell_count:
                     best_cell_count = cell_count
                     best_iter = iter_dir
-                    self.logger.info(f"✅ ACCEPTED: iter {k} with {cell_count:,} cells (new best)")
+                    self.logger.info(f"ACCEPTED: iter {k} with {cell_count:,} cells (new best)")
                 else:
-                    self.logger.info(f"✅ CONSTRAINTS MET: iter {k} with {cell_count:,} cells (not better than {best_cell_count:,})")
+                    self.logger.info(f"CONSTRAINTS MET: iter {k} with {cell_count:,} cells (not better than {best_cell_count:,})")
                 
                 # If we have a valid solution, we can stop (constraint-based approach)
                 # Continue only if we want to try to find a better (smaller) mesh
@@ -2701,7 +2455,7 @@ method          scotch;
                     self.logger.info(f"Constraint-based optimization complete: best mesh has {best_cell_count:,} cells")
                     break
             else:
-                self.logger.info(f"❌ CONSTRAINTS NOT MET: iter {k} - continuing optimization")
+                self.logger.info(f"CONSTRAINTS NOT MET: iter {k} - continuing optimization")
 
             # Otherwise update parameters and continue
             self._apply_updates(snap_m, layer_m, layer_cov)

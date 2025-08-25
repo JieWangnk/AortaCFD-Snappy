@@ -161,7 +161,7 @@ def check_mesh_quality(mesh_dir, openfoam_env, max_memory_gb=8, deep_check=False
     
     return metrics
 
-def parse_layer_coverage(mesh_dir, openfoam_env, max_memory_gb=8):
+def parse_layer_coverage(mesh_dir, openfoam_env, max_memory_gb=8, wall_name="wall_aorta"):
     """
     Parse boundary layer coverage from snappyHexMesh logs with improved tolerance
     """
@@ -206,11 +206,11 @@ def parse_layer_coverage(mesh_dir, openfoam_env, max_memory_gb=8):
                     coverage_data["faces_with_layers"] = faces_with_layers
                     coverage_data["totalFaces"] = total_faces
                     coverage_data["coverage_overall"] = coverage_pct / 100.0
-                    coverage_data["perPatch"]["wall_aorta"] = coverage_pct / 100.0
+                    coverage_data["perPatch"][wall_name] = coverage_pct / 100.0
                     break
             
             # Also parse summary table format: "wall_aorta 17014    3.75     0.000313  84"
-            if "wall_aorta" in line and len(line.split()) >= 5:
+            if wall_name in line and len(line.split()) >= 5:
                 parts = line.split()
                 try:
                     patch_faces = int(parts[1])
@@ -222,7 +222,7 @@ def parse_layer_coverage(mesh_dir, openfoam_env, max_memory_gb=8):
                         if coverage_data["coverage_overall"] == 0.0:
                             coverage_data["totalFaces"] = patch_faces
                             coverage_data["coverage_overall"] = thickness_pct / 100.0
-                            coverage_data["perPatch"]["wall_aorta"] = thickness_pct / 100.0
+                            coverage_data["perPatch"][wall_name] = thickness_pct / 100.0
                             # Estimate faces with layers from average (conservative estimate)
                             coverage_data["faces_with_layers"] = int(patch_faces * min(avg_layers / 5.0, 0.9))
                 except (ValueError, IndexError):

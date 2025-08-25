@@ -58,13 +58,13 @@
   
   "advanced": {
     "BLOCKMESH": {
-      "cell_size_m": 0.0003,
+      "cell_size_m": 0.0002,
       "grading": [1, 1, 1]
     },
     
     "SNAPPY": {
-      "maxLocalCells": 20000000,
-      "maxGlobalCells": 80000000,
+      "maxLocalCells": 2000000,
+      "maxGlobalCells": 8000000,
       "nCellsBetweenLevels": 1,
       "resolveFeatureAngle": 45,
       "nSmoothPatch": 3,

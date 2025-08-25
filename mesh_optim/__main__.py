@@ -5,6 +5,7 @@ CLI entry point for mesh optimization package
 import argparse
 import sys
 import logging
+import json
 from pathlib import Path
 
 def setup_logging(verbose=False):
@@ -31,11 +32,14 @@ Examples:
   # Stage 1: Geometry-driven mesh optimization
   python -m mesh_optim stage1 --geometry cases_input/patient1 --config mesh_optim/configs/stage1_default.json
 
-  # Stage 2: QoI-driven optimization for RANS
+  # Stage 2: GCI-based WSS convergence verification (literature-backed)
   python -m mesh_optim stage2 --geometry cases_input/patient1 --model RANS
 
-  # Stage 2: QoI-driven optimization for LES
-  python -m mesh_optim stage2 --geometry cases_input/patient1 --model LES --config mesh_optim/configs/stage2_les.json
+  # Stage 2: LES verification (requires high-end hardware)
+  python -m mesh_optim stage2 --geometry cases_input/patient1 --model LES
+
+  # Stage 2: Laminar verification (for low Reynolds number cases)
+  python -m mesh_optim stage2 --geometry cases_input/patient1 --model LAMINAR
         """
     )
     
@@ -50,7 +54,7 @@ Examples:
     stage1_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # Stage 2 subparser
-    stage2_parser = subparsers.add_parser('stage2', help='QoI-driven mesh optimization')
+    stage2_parser = subparsers.add_parser('stage2', help='GCI-based WSS convergence verification')
     stage2_parser.add_argument('--geometry', required=True, help='Path to geometry directory')
     stage2_parser.add_argument('--model', choices=['LAMINAR', 'RANS', 'LES'], default='RANS', help='Flow model')
     stage2_parser.add_argument('--config', help='Configuration file (default: auto-select based on model)')
@@ -58,6 +62,8 @@ Examples:
     stage2_parser.add_argument('--max-iterations', type=int, default=3, help='Maximum QoI iterations')
     stage2_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     stage2_parser.add_argument('--skip-cfd', action='store_true', help='Skip CFD simulations (mesh-only mode)')
+    stage2_parser.add_argument('--conservative', action='store_true', help='Use conservative settings (prevents crashes)')
+    stage2_parser.add_argument('--max-memory', type=float, help='Maximum memory limit in GB (auto-detected if not set)')
     
     args = parser.parse_args()
     
@@ -93,7 +99,16 @@ Examples:
             logger.info(f"✅ Stage 1 completed: {result_dir}")
             
         elif args.stage == 'stage2':
-            from .stage2_qoi import Stage2QOIOptimizer
+            from .stage2_gci import Stage2GCIVerifier
+            
+            # Check system resources and warn user
+            import psutil
+            memory_gb = psutil.virtual_memory().available / (1024**3)
+            cpu_count = psutil.cpu_count()
+            
+            logger.info(f"🖥️  System: {memory_gb:.1f}GB RAM, {cpu_count} CPUs")
+            if memory_gb < 4:
+                logger.warning("⚠️ Low memory detected - consider using --conservative flag")
             
             # Generate default output path if not specified
             if not args.output:
@@ -101,51 +116,63 @@ Examples:
                 model_suffix = args.model.lower()
                 args.output = Path("output") / patient_name / "meshOptimizer" / f"stage2_{model_suffix}"
             
-            cfd_mode = "mesh-only" if args.skip_cfd else "with CFD"
-            logger.info(f"Starting Stage 2 QoI optimization: {args.geometry} ({args.model}) [{cfd_mode}]")
-            logger.info(f"Output directory: {args.output}")
-            optimizer = Stage2QOIOptimizer(args.geometry, args.model, args.config, args.output)
+            logger.info(f"Starting Stage 2 GCI verification: {args.geometry} ({args.model})")
             
-            # Disable CFD if requested
+            # Find Stage 1 best mesh
+            patient_name = Path(args.geometry).name
+            stage1_best = Path("output") / patient_name / "meshOptimizer" / "stage1" / "best"
+            
+            if not stage1_best.exists():
+                logger.error(f"❌ Stage 1 mesh not found: {stage1_best}")
+                logger.info("💡 Run Stage 1 first: python -m mesh_optim stage1 --geometry tutorial/patient1")
+                return 1
+            
+            # Load configuration
+            if not args.config:
+                args.config = Path(__file__).parent / "configs" / "stage1_default.json"
+            
+            with open(args.config) as f:
+                config = json.load(f)
+            
+            verifier = Stage2GCIVerifier(stage1_best, config, args.model, Path(args.geometry))
+            
+            # Skip CFD mode not applicable to GCI verification
             if args.skip_cfd:
-                optimizer.cfd_solver = None
-                logger.info("⚠️ CFD simulations disabled - using mesh-based estimates only")
+                logger.warning("⚠️ --skip-cfd not supported for GCI verification (requires WSS data)")
+                logger.info("💡 Use Stage 1 geometry-only optimization instead")
+                return 1
             
-            if args.max_iterations:
-                optimizer.max_iterations = args.max_iterations
-                
-            result_dir, qoi_metrics = optimizer.iterate_until_converged()
+            # Execute GCI verification
+            logger.info(f"🔬 Using Stage 1 mesh: {stage1_best}")
+            results = verifier.execute()
             
-            if qoi_metrics.get("valid", False):
-                logger.info(f"✅ Stage 2 completed: {result_dir}")
-                logger.info("📊 Final QoI Summary:")
+            if results["status"] == "SUCCESS":
+                logger.info(f"✅ Stage 2 GCI verification completed")
+                logger.info("📊 Final GCI Summary:")
                 
-                # Mesh quality summary
-                mesh_quality = qoi_metrics.get("mesh_quality", {})
-                logger.info(f"  Cells: {mesh_quality.get('cells', 0):,}")
-                logger.info(f"  Max skewness: {mesh_quality.get('max_skewness', 0):.2f}")
-                logger.info(f"  Max non-orthogonality: {mesh_quality.get('max_nonortho', 0):.1f}°")
+                gci_results = results["gci_analysis"]
+                logger.info(f"  Accepted mesh level: {results['accepted_level']}")
+                logger.info(f"  GCI convergence: {gci_results['gci_21']:.1f}% (target: ≤{gci_results['tolerance_pct']}%)")
+                logger.info(f"  Richardson apparent order: {gci_results['apparent_order']:.2f}")
+                logger.info(f"  Refinement ratio: {gci_results['refinement_ratio']}")
                 
-                # Layer analysis summary
-                layer_analysis = qoi_metrics.get("layer_analysis", {})
-                logger.info(f"  Layer coverage: {layer_analysis.get('coverage_overall', 0)*100:.1f}%")
+                # WSS metrics summary
+                wss_metrics = results["wss_metrics"]
+                logger.info("  TAWSS (Time-Averaged Wall Shear Stress):")
+                for level in ["coarse", "medium", "fine"]:
+                    tawss = wss_metrics[level]["TAWSS"]["global_mean"]
+                    logger.info(f"    {level}: {tawss:.3f} Pa")
                 
-                # CFD results summary (if available)
-                cfd_results = qoi_metrics.get("cfd_results", {})
-                if cfd_results and not cfd_results.get("error"):
-                    logger.info("  CFD Analysis:")
-                    yplus = cfd_results.get("yplus_analysis", {})
-                    if yplus.get("available"):
-                        logger.info(f"    Y+ range: {yplus.get('min_yplus', 0):.1f}-{yplus.get('max_yplus', 0):.1f} (mean: {yplus.get('mean_yplus', 0):.1f})")
-                        logger.info(f"    Y+ coverage: {yplus.get('coverage_in_range', 0)*100:.1f}%")
-                    
-                    wss = cfd_results.get("wss_analysis", {})
-                    if wss.get("available"):
-                        logger.info(f"    WSS range: {wss.get('min_wss', 0):.1f}-{wss.get('max_wss', 0):.1f} Pa (mean: {wss.get('mean_wss', 0):.1f} Pa)")
+                logger.info("  OSI (Oscillatory Shear Index):")
+                for level in ["coarse", "medium", "fine"]:
+                    osi = wss_metrics[level]["OSI"]["global_mean"]
+                    logger.info(f"    {level}: {osi:.4f}")
                 
-                logger.info(f"  Overall converged: {qoi_metrics.get('converged', False)}")
+                logger.info(f"  Mesh convergence: {'✅ CONVERGED' if gci_results['converged'] else '❌ NOT CONVERGED'}")
+                logger.info(f"  Ready for production CFD studies: {results['accepted_mesh_path']}")
             else:
-                logger.warning(f"⚠️ Stage 2 incomplete: {result_dir}")
+                logger.error(f"❌ Stage 2 GCI verification failed: {results.get('error', 'Unknown error')}")
+                return 1
         
         return 0
         

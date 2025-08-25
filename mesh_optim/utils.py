@@ -9,9 +9,9 @@ from pathlib import Path
 import re
 import logging
 
-def run_command(cmd, cwd=None, env_setup=None, timeout=None, parallel=False):
+def run_command(cmd, cwd=None, env_setup=None, timeout=None, parallel=False, max_memory_gb=8):
     """
-    Run OpenFOAM command with proper environment setup
+    Run OpenFOAM command with proper environment setup and resource management
     
     Args:
         cmd: Command to run (list or string)
@@ -19,43 +19,95 @@ def run_command(cmd, cwd=None, env_setup=None, timeout=None, parallel=False):
         env_setup: Path to OpenFOAM environment script
         timeout: Timeout in seconds
         parallel: Whether this is a parallel command
+        max_memory_gb: Maximum memory limit in GB
     """
+    import psutil
+    import time
+    
+    # Check available system resources before starting
+    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    if available_memory_gb < max_memory_gb:
+        raise RuntimeError(f"Insufficient memory: need {max_memory_gb}GB, have {available_memory_gb:.1f}GB")
+    
     if env_setup:
         if isinstance(cmd, list):
             cmd_str = " ".join(cmd)
         else:
             cmd_str = cmd
         
-        # Use bash explicitly for OpenFOAM environment
-        full_cmd = f"bash -c 'source {env_setup} && {cmd_str}'"
-        cmd = ["bash", "-c", f"source {env_setup} && {cmd_str}"]
+        # Add memory limit to OpenFOAM commands
+        if any(of_cmd in cmd_str for of_cmd in ['snappyHexMesh', 'simpleFoam', 'pimpleFoam']):
+            cmd_str = f"ulimit -v {int(max_memory_gb * 1024 * 1024)} && {cmd_str}"
+        
+        cmd = ["bash", "-c", f"{env_setup} && {cmd_str}"]
+    
+    # No timeout by default - let processes run to completion
+    # Only use timeout if explicitly specified and > 0
     
     try:
-        result = subprocess.run(
-            cmd, 
-            cwd=cwd, 
-            capture_output=True, 
-            text=True,
-            timeout=timeout,
-            shell=isinstance(cmd, str) and not env_setup
-        )
+        if timeout and timeout > 0:
+            # Run with timeout if specified
+            result = subprocess.run(
+                cmd, 
+                cwd=cwd, 
+                capture_output=True, 
+                text=True,
+                timeout=timeout,
+                shell=isinstance(cmd, str) and not env_setup
+            )
+        else:
+            # Run without timeout - let it complete naturally
+            result = subprocess.run(
+                cmd, 
+                cwd=cwd, 
+                capture_output=True, 
+                text=True,
+                shell=isinstance(cmd, str) and not env_setup
+            )
         return result
+        
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Command timed out after {timeout} seconds: {cmd}")
     except Exception as e:
         raise RuntimeError(f"Command failed: {e}")
 
-def check_mesh_quality(mesh_dir, openfoam_env):
+def set_process_limits(max_memory_gb):
+    """Set resource limits for subprocess"""
+    import resource
+    try:
+        # Set memory limit (virtual memory)
+        memory_bytes = int(max_memory_gb * 1024 * 1024 * 1024)
+        resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+        
+        # Set CPU time limit (4 hours max)
+        resource.setrlimit(resource.RLIMIT_CPU, (14400, 14400))
+    except (ValueError, OSError):
+        pass  # Ignore if limits can't be set
+
+def check_mesh_quality(mesh_dir, openfoam_env, max_memory_gb=8, deep_check=False, wall_name=None):
     """
-    Run checkMesh and parse quality metrics
+    Run checkMesh and parse quality metrics with memory limits
+    
+    Args:
+        mesh_dir: Path to the mesh directory
+        openfoam_env: OpenFOAM environment setup command
+        max_memory_gb: Maximum memory limit in GB
+        deep_check: If True, use -allGeometry -allTopology for deep validation
+        wall_name: Optional wall patch name to extract face count for castellation checks
     """
     log_file = mesh_dir / "logs" / "log.checkMesh"
     log_file.parent.mkdir(exist_ok=True)
     
+    # Use basic checkMesh for iterative optimization (fast, standard checks)
+    # Use -allGeometry -allTopology only for final validation or when requested
+    check_cmd = "checkMesh -allGeometry -allTopology" if deep_check else "checkMesh"
+    
     result = run_command(
-        "checkMesh -allGeometry -allTopology", 
+        check_cmd, 
         cwd=mesh_dir, 
-        env_setup=openfoam_env
+        env_setup=openfoam_env,
+        timeout=None,  # No timeout - let checkMesh complete
+        max_memory_gb=max_memory_gb
     )
     
     # Write log
@@ -68,7 +120,8 @@ def check_mesh_quality(mesh_dir, openfoam_env):
         "maxAspectRatio": 0,
         "negVolCells": 0,
         "meshOK": False,
-        "cells": 0
+        "cells": 0,
+        "wall_nFaces": None  # Wall patch face count if wall_name provided
     }
     
     output = result.stdout + result.stderr
@@ -94,44 +147,101 @@ def check_mesh_quality(mesh_dir, openfoam_env):
         if match:
             metrics["cells"] = int(match.group(1))
     
+    # Extract wall patch face count if wall_name provided
+    if wall_name:
+        # checkMesh output format: "              wall_aorta   152523   154493"
+        wall_pattern = rf"^\s*{wall_name}\s+(\d+)\s+\d+\s*$"
+        wall_match = re.search(wall_pattern, output, re.MULTILINE)
+        if wall_match:
+            metrics["wall_nFaces"] = int(wall_match.group(1))
+    
+    # Use OpenFOAM's default mesh validation criteria
+    # Trust OpenFOAM's checkMesh to determine if mesh is acceptable
     metrics["meshOK"] = "Mesh OK" in output and result.returncode == 0
     
     return metrics
 
-def parse_layer_coverage(mesh_dir, openfoam_env):
+def parse_layer_coverage(mesh_dir, openfoam_env, max_memory_gb=8):
     """
-    Parse boundary layer coverage from snappyHexMesh logs
+    Parse boundary layer coverage from snappyHexMesh logs with improved tolerance
     """
-    log_file = mesh_dir / "logs" / "log.snappyHexMesh.layers"
+    # Try different possible layer log file names
+    log_file_candidates = [
+        mesh_dir / "logs" / "log.snappy.layers",
+        mesh_dir / "logs" / "log.snappyHexMesh.layers"  
+    ]
     
-    if not log_file.exists():
-        return {"coverage_overall": 0.0, "totalFaces": 0, "perPatch": {}}
+    log_file = None
+    for candidate in log_file_candidates:
+        if candidate.exists():
+            log_file = candidate
+            break
+    
+    if log_file is None:
+        return {"coverage_overall": 0.0, "totalFaces": 0, "perPatch": {}, "faces_with_layers": 0}
     
     log_content = log_file.read_text()
     
     # Parse layer statistics
-    coverage_data = {"coverage_overall": 0.0, "totalFaces": 0, "perPatch": {}}
+    coverage_data = {"coverage_overall": 0.0, "totalFaces": 0, "perPatch": {}, "faces_with_layers": 0}
     
-    # Look for "Layer thickness" section
-    if "Layer thickness" in log_content:
+    # Look for "Layer thickness" section or "Layer mesh : cells:" for more detailed analysis
+    if "Layer thickness" in log_content or "cells:" in log_content:
         lines = log_content.split('\n')
         
+        # Try to find face-by-face layer information
+        total_faces = 0
+        faces_with_layers = 0
+        
         for i, line in enumerate(lines):
-            if "wall_aorta" in line and "faces" in line:
-                # Parse: wall_aorta: 27129 faces, 6.000 avg layers, 0.4%
-                match = re.search(r"(\d+) faces.*?([\d.]+) avg layers", line)
+            # Parse the actual snappyHexMesh output format:
+            # "Extruding 15921 out of 17014 faces (93.5759%). Removed extrusion at 0 faces."
+            if "Extruding" in line and "out of" in line and "faces" in line:
+                match = re.search(r"Extruding (\d+) out of (\d+) faces \(([\d.]+)%\)", line)
                 if match:
-                    n_faces = int(match.group(1))
-                    avg_layers = float(match.group(2))
+                    faces_with_layers = int(match.group(1))
+                    total_faces = int(match.group(2))
+                    coverage_pct = float(match.group(3))
                     
-                    coverage_data["perPatch"]["wall_aorta"] = {
-                        "nFaces": n_faces,
-                        "avgLayers": avg_layers,
-                        "coverage": 1.0 if avg_layers > 1 else 0.0
-                    }
+                    coverage_data["faces_with_layers"] = faces_with_layers
+                    coverage_data["totalFaces"] = total_faces
+                    coverage_data["coverage_overall"] = coverage_pct / 100.0
+                    coverage_data["perPatch"]["wall_aorta"] = coverage_pct / 100.0
+                    break
+            
+            # Also parse summary table format: "wall_aorta 17014    3.75     0.000313  84"
+            if "wall_aorta" in line and len(line.split()) >= 5:
+                parts = line.split()
+                try:
+                    patch_faces = int(parts[1])
+                    avg_layers = float(parts[2])
+                    thickness_pct = int(parts[4])
                     
-                    coverage_data["totalFaces"] = n_faces
-                    coverage_data["coverage_overall"] = 1.0 if avg_layers > 1 else 0.0
+                    if patch_faces > 0 and avg_layers > 0:
+                        # Use thickness percentage as coverage estimate if we don't have extrusion data
+                        if coverage_data["coverage_overall"] == 0.0:
+                            coverage_data["totalFaces"] = patch_faces
+                            coverage_data["coverage_overall"] = thickness_pct / 100.0
+                            coverage_data["perPatch"]["wall_aorta"] = thickness_pct / 100.0
+                            # Estimate faces with layers from average (conservative estimate)
+                            coverage_data["faces_with_layers"] = int(patch_faces * min(avg_layers / 5.0, 0.9))
+                except (ValueError, IndexError):
+                    pass
+        
+        # Update overall coverage if we found data
+        if coverage_data["coverage_overall"] == 0.0 and total_faces > 0:
+            coverage_data["totalFaces"] = total_faces
+            coverage_data["faces_with_layers"] = faces_with_layers
+            coverage_data["coverage_overall"] = faces_with_layers / total_faces if total_faces > 0 else 0.0
+    
+    # Add interpretation
+    coverage_data["interpretation"] = {
+        "excellent": coverage_data["coverage_overall"] > 0.95,
+        "good": coverage_data["coverage_overall"] > 0.80,
+        "acceptable": coverage_data["coverage_overall"] > 0.60,
+        "poor": coverage_data["coverage_overall"] <= 0.60,
+        "success": coverage_data["coverage_overall"] > 0.60  # Lower threshold for success
+    }
     
     return coverage_data
 

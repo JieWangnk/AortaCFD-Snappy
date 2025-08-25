@@ -103,12 +103,13 @@ class PhysicsAwareMeshGenerator:
         
         return results
     
-    def compute_stl_bounding_box(self, stl_files: Dict[str, Path]) -> Dict:
+    def compute_stl_bounding_box(self, stl_files: Dict[str, Path], skip_scaling: bool = False) -> Dict:
         """
         Compute bounding box from STL files for automatic mesh domain calculation
         
         Args:
             stl_files: Dictionary with STL file names and paths
+            skip_scaling: If True, keep original units (no mm->m conversion)
             
         Returns:
             Dictionary with bounding box coordinates and mesh domain parameters
@@ -158,17 +159,26 @@ class PhysicsAwareMeshGenerator:
                 
             all_vertices = np.array(all_vertices)
             
-            # Calculate bounding box (assuming STL coordinates in mm)
+            # Calculate bounding box
             x_min, x_max = all_vertices[:, 0].min(), all_vertices[:, 0].max()
             y_min, y_max = all_vertices[:, 1].min(), all_vertices[:, 1].max() 
             z_min, z_max = all_vertices[:, 2].min(), all_vertices[:, 2].max()
             
-            # Convert from mm to meters
-            bbox_m = {
-                "x_min": x_min * 1e-3, "x_max": x_max * 1e-3,
-                "y_min": y_min * 1e-3, "y_max": y_max * 1e-3,
-                "z_min": z_min * 1e-3, "z_max": z_max * 1e-3
-            }
+            # Apply scaling if requested
+            if skip_scaling:
+                # Keep original coordinates (e.g., mm)
+                bbox_m = {
+                    "x_min": x_min, "x_max": x_max,
+                    "y_min": y_min, "y_max": y_max,
+                    "z_min": z_min, "z_max": z_max
+                }
+            else:
+                # Convert from mm to meters (default behavior)
+                bbox_m = {
+                    "x_min": x_min * 1e-3, "x_max": x_max * 1e-3,
+                    "y_min": y_min * 1e-3, "y_max": y_max * 1e-3,
+                    "z_min": z_min * 1e-3, "z_max": z_max * 1e-3
+                }
             
             # Calculate dimensions
             length = bbox_m["z_max"] - bbox_m["z_min"]
@@ -472,15 +482,17 @@ class PhysicsAwareMeshGenerator:
             "n_surface_layers": 10,
             "expansion_ratio": 1.25,
             "base_cell_target": diameter / 45,  # D/40-D/50
+            "diameter_resolution_factor": 45,  # For Stage 2 consistency
             "surface_refinement_level": [2, 3],
             "target_cells_range": [2e6, 5e6],
             "distance_refinement": {
-                "near_distance": 1.5e-3,  # 1.5 mm
-                "far_distance": 3.0e-3,   # 3.0 mm
-                "transition_distance": 6.0e-3
+                "near_distance": max(1.5e-3, first_layer * 20),  # At least 20x first layer
+                "far_distance": max(3.0e-3, diameter * 0.15),   # 15% of diameter
+                "transition_distance": max(6.0e-3, diameter * 0.3)
             },
             "minimum_diameter": diameter,
             "peak_velocity": peak_velocity,
+            "characteristic_length": diameter * 3.76,  # ~4D length for aortic arch
             "reynolds": layer_calc["reynolds"],
             "flow_regime": layer_calc["flow_regime"],
             "friction_coefficient": layer_calc["friction_coefficient"],
@@ -506,15 +518,17 @@ class PhysicsAwareMeshGenerator:
             "n_surface_layers": 12,
             "expansion_ratio": 1.20,
             "base_cell_target": diameter / 55,  # D/50-D/60
+            "diameter_resolution_factor": 55,  # For Stage 2 consistency
             "surface_refinement_level": [3, 4],
             "target_cells_range": [5e6, 10e6],
             "distance_refinement": {
-                "near_distance": 1.0e-3,  # 1.0 mm - tighter for RANS
-                "far_distance": 2.5e-3,   # 2.5 mm 
-                "transition_distance": 5.0e-3
+                "near_distance": max(1.0e-3, first_layer * 15),  # At least 15x first layer
+                "far_distance": max(2.5e-3, diameter * 0.10),   # 10% of diameter
+                "transition_distance": max(5.0e-3, diameter * 0.25)
             },
             "minimum_diameter": diameter,
             "peak_velocity": peak_velocity,
+            "characteristic_length": diameter * 3.76,  # ~4D length for aortic arch
             "reynolds": layer_calc["reynolds"],
             "flow_regime": layer_calc["flow_regime"],
             "friction_coefficient": layer_calc["friction_coefficient"],

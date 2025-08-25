@@ -16,17 +16,23 @@ from .utils import run_command
 class CFDSolver:
     """CFD solver for QoI validation in cardiovascular flows"""
     
-    def __init__(self, flow_model: str = "RANS", openfoam_env: str = "/opt/openfoam12/etc/bashrc"):
+    def __init__(self, flow_model: str = "RANS", openfoam_env: str = "/opt/openfoam12/etc/bashrc", max_memory_gb: float = 8):
         """
         Initialize CFD solver
         
         Args:
             flow_model: Flow regime ('LAMINAR', 'RANS', or 'LES')
             openfoam_env: Path to OpenFOAM environment setup
+            max_memory_gb: Maximum memory limit in GB
         """
         self.flow_model = flow_model.upper()
         self.openfoam_env = openfoam_env
+        self.max_memory_gb = max_memory_gb
         self.logger = logging.getLogger(f"CFDSolver_{flow_model}")
+        
+        # Adjust solver settings based on memory constraints
+        if max_memory_gb < 4:
+            self.logger.warning(f"⚠️ Low memory mode: {max_memory_gb:.1f}GB - using conservative settings")
         
         # Blood properties at 37°C
         self.blood_properties = {
@@ -774,12 +780,13 @@ nu              {self.blood_properties["kinematic_viscosity"]};
         """Run steady-state solver (LAMINAR/RANS)"""
         
         try:
-            # Run solver
+            # Run solver with memory limits - no timeout, let it converge
             result = run_command(
                 f"{solver} -case {case_dir}",
                 cwd=case_dir,
                 env_setup=self.openfoam_env,
-                timeout=1800  # 30 minutes max
+                timeout=None,  # No timeout - let solver converge
+                max_memory_gb=self.max_memory_gb
             )
             
             # Parse residuals
@@ -800,12 +807,13 @@ nu              {self.blood_properties["kinematic_viscosity"]};
         """Run transient solver (LES)"""
         
         try:
-            # Run solver
+            # Run solver with memory limits - no timeout, let it complete 
             result = run_command(
                 f"{solver} -case {case_dir}",
                 cwd=case_dir,
                 env_setup=self.openfoam_env,
-                timeout=3600  # 60 minutes max
+                timeout=None,  # No timeout - let LES complete all time steps
+                max_memory_gb=self.max_memory_gb
             )
             
             return {

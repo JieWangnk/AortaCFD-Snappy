@@ -7,9 +7,9 @@ Two-stage mesh optimization approach:
 """
 
 from .stage1_mesh import Stage1MeshOptimizer
-from .stage2_qoi import Stage2QOIOptimizer
+from .stage2_gci import Stage2GCIVerifier
 from .physics_mesh import PhysicsAwareMeshGenerator
 from .utils import run_command, check_mesh_quality, parse_layer_coverage
 
 __version__ = "1.0.0"
-__all__ = ["Stage1MeshOptimizer", "Stage2QOIOptimizer", "PhysicsAwareMeshGenerator", "run_command", "check_mesh_quality", "parse_layer_coverage"]
+__all__ = ["Stage1MeshOptimizer", "Stage2GCIVerifier", "PhysicsAwareMeshGenerator", "run_command", "check_mesh_quality", "parse_layer_coverage"]

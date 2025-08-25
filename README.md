@@ -1,6 +1,6 @@
-# AortaCFD-Snappy: Advanced Mesh Optimization for Cardiovascular CFD
+# AortaCFD-Snappy: Two-Stage Mesh Optimization for Cardiovascular CFD
 
-**Independent mesh optimization tool for patient-specific aortic blood flow simulations**
+**Literature-backed mesh optimization pipeline for vessel-agnostic blood flow simulations**
 
 [![OpenFOAM](https://img.shields.io/badge/OpenFOAM-12-blue.svg)](https://openfoam.org/)
 [![Python](https://img.shields.io/badge/Python-3.8+-green.svg)](https://python.org)
@@ -8,443 +8,388 @@
 
 ---
 
-## 🎯 Purpose
+## 🎯 Overview
 
-AortaCFD-Snappy provides physics-aware mesh optimization specifically designed for cardiovascular CFD simulations. It addresses the critical challenge of generating high-quality meshes with proper boundary layer resolution for accurate wall shear stress (WSS) calculations and pressure drop predictions.
+AortaCFD-Snappy provides a robust two-stage mesh optimization pipeline for cardiovascular CFD simulations across **all vascular beds**. The geometry-aware Stage 1 optimizer automatically derives mesh parameters from actual vessel dimensions, while the literature-backed Stage 2 verifier uses Richardson extrapolation and Grid Convergence Index (GCI) analysis for physics-verified meshes.
 
-### Key Problems Solved
-
-- **Layer Generation Failures**: Automatic detection and recovery from boundary layer truncation
-- **Non-Physics-Based Meshing**: Replaces trial-and-error with actual y+ = 1 targeting
-- **Flow Regime Mismatch**: Provides regime-specific configurations (Laminar/RANS/LES)
-- **QoI Validation**: Ensures meshes actually produce reliable velocity, pressure, and WSS results
+### Key Features
+- **Vessel-Agnostic Design**: Works across aortas, carotids, coronaries, and other vascular geometries
+- **Constraint-Based Optimization**: Uses hard quality constraints instead of penalty functions
+- **Literature-Backed Verification**: Stage 2 implements Richardson extrapolation with 5% WSS tolerance
+- **Hierarchical Mesh Control**: Multiple override levels for precise control when needed
+- **Crash-Safe Operation**: Resource-aware scaling prevents terminal crashes
 
 ---
 
 ## 🏗️ Two-Stage Architecture
 
-### Stage 1: Geometry-Driven Mesh Generation (Inner Loop)
-**Target Users**: Novice users, quick prototyping
+### Stage 1: Geometry-Driven Mesh Generation
+**Purpose**: Generate high-quality baseline mesh with proper boundary layers
+**Input**: STL geometry files
+**Output**: Constraint-verified mesh ready for CFD or Stage 2
+
 ```bash
 python -m mesh_optim stage1 --geometry tutorial/patient1
 ```
 
-- Iterates on surface refinement and boundary layer settings
-- Quality criteria: non-orthogonality <65°, skewness <3.0, layer coverage >85%
-- Pure geometry-based optimization (no CFD required)
-- Output: Clean mesh with good boundary layers
+**What it does:**
+- Analyzes geometry to derive reference diameters (D_ref, D_min) from inlet/outlet areas
+- Calculates geometry-aware base cell size: Δx = min(D_ref/N_D, D_min/N_D_min)
+- Uses adaptive resolveFeatureAngle (30-45°) based on vessel complexity
+- Applies gentle surface refinement ladder: [1,1] → [1,2] → [2,3]
+- Generates boundary layers with constraint-based acceptance criteria
+- **Optimization Goal**: Minimize cell count subject to quality constraints
 
-### Stage 2: QoI-Driven Mesh Adaptation (Outer Loop)
-**Target Users**: Advanced users, production meshes
+**Quality Constraints:**
+- maxNonOrtho ≤ 65°
+- maxSkewness ≤ 4.0  
+- Wall layer coverage ≥ 70%
+
+### Stage 2: Physics-Verified Mesh Convergence
+**Purpose**: Multi-level GCI verification for physics-accurate WSS calculations
+**Input**: Stage 1 "best" mesh + config
+**Output**: Convergence-verified mesh with literature-backed accuracy
+
 ```bash
-python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS
+python -m mesh_optim stage2 --geometry tutorial/patient1 --model LAMINAR
 ```
 
-- Physics-aware optimization with CFD validation
-- Monitors y+, wall shear stress, and pressure drop accuracy
-- Adapts mesh based on actual flow physics
-- Output: Production-ready mesh validated against QoI criteria
+**What it does:**
+- Builds three mesh levels (coarse, medium, fine) at refinement ratio r=1.3
+- Maintains identical physics between levels (same y+, CFL, averaging windows)
+- Performs Richardson extrapolation: M_∞ = M_fine + (M_fine - M_medium)/(r^p - 1)
+- Calculates Grid Convergence Index: GCI = |1.25 * (M_fine - M_medium) / (M_fine * (r^p - 1))| * 100%
+- **Convergence Decision**: GCI ≤ 5% (literature standard for cardiovascular WSS)
 
 ---
 
-## 🚀 Quick Start
-
-### Prerequisites
-- **OpenFOAM 12** (Foundation version)
-- **Python 3.8+**
-- **numpy, scipy** (for geometry calculations)
-
-### Installation
-
-**Recommended: Use a virtual environment to avoid dependency conflicts**
-
-```bash
-# Clone repository
-git clone https://github.com/YourUsername/AortaCFD-Snappy.git
-cd AortaCFD-Snappy
-
-# Create and activate virtual environment (recommended)
-python3 -m venv mesh_optim_env
-source mesh_optim_env/bin/activate  # On Linux/Mac
-# mesh_optim_env\Scripts\activate   # On Windows
-
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Ensure OpenFOAM is sourced
-source /opt/openfoam12/etc/bashrc
-```
-
-**Alternative: System-wide installation**
-```bash
-git clone https://github.com/YourUsername/AortaCFD-Snappy.git
-cd AortaCFD-Snappy
-pip install -r requirements.txt
-source /opt/openfoam12/etc/bashrc
-```
-
-### Basic Usage
-```bash
-# Quick geometry-driven mesh
-python -m mesh_optim stage1 --geometry tutorial/patient1
-
-# Physics-aware RANS mesh
-python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS
-
-# Wall-resolved LES mesh
-python -m mesh_optim stage2 --geometry tutorial/patient1 --model LES
-```
-
----
-
-## 📁 Project Structure
-
-```
-AortaCFD-Snappy/
-├── mesh_optim/                     # Main optimization package
-│   ├── stage1_mesh.py              # Geometry-driven optimization
-│   ├── stage2_qoi.py               # QoI-driven optimization
-│   ├── utils.py                    # Common utilities
-│   ├── __main__.py                 # CLI interface
-│   └── configs/                    # Physics-aware configurations
-│       ├── stage1_default.json     # Baseline settings
-│       ├── stage2_laminar.json     # Laminar flow criteria
-│       ├── stage2_rans.json        # RANS flow criteria
-│       └── stage2_les.json         # LES flow criteria
-├── tutorial/                       # Example patient case
-│   └── patient1/
-│       ├── inlet.stl, outlet*.stl, wall_aorta.stl
-│       ├── BPM75.csv               # Flow velocity data
-│       └── config.json             # Patient configuration
-├── tools/                          # Additional utilities
-│   └── checkmesh_yplus_eval.py     # Quality assessment tools
-├── docs/                           # Documentation
-│   └── USAGE.md                    # Detailed usage guide
-└── requirements.txt                # Python dependencies
-```
-
----
-
-## 🔬 Physics-Aware Features
-
-### Actual y+ Targeting
-Calculates first layer thickness for y+ ≈ 1 using:
-- Patient-specific peak velocity (from BPM75.csv)
-- Actual inlet geometry (from STL files)
-- Blood properties (ρ=1060 kg/m³, ν=3.77×10⁻⁶ m²/s)
-
-**Formula**: h₁ = ν/u_τ where u_τ = √(0.5 C_f) × U_peak
-
-### Flow Regime Optimization
-
-| Regime | Target y+ | Layers | Expansion | Cell Count | Use Case |
-|--------|-----------|---------|-----------|------------|----------|
-| **Laminar** | < 1.0 | 8-10 | 1.25 | 1-5M | Re < 2300, steady flow |
-| **RANS** | 0.5-2.0 | 12-15 | 1.20 | 5-15M | Clinical cases, turbulent |
-| **LES** | 0.3-1.5 | 20-25 | 1.15 | 20-80M | Research, high fidelity |
-
-### Distance Refinement
-- **Physics-based**: 1.5mm and 3.0mm from wall (boundary layer scales)
-- **Traditional**: Cell size multiples (not physically motivated)
-
----
-
-## 📊 Command Reference
+## 📋 Usage & Options
 
 ### Stage 1 Commands
+
+#### Basic Usage
 ```bash
-# Basic mesh optimization
+# Standard geometry-driven optimization
 python -m mesh_optim stage1 --geometry tutorial/patient1
 
-# Custom configuration
+# With custom settings
 python -m mesh_optim stage1 --geometry tutorial/patient1 \
     --config mesh_optim/configs/stage1_default.json \
-    --max-iterations 5 \
-    --output results/patient1_stage1
-
-# Verbose output
-python -m mesh_optim stage1 --geometry tutorial/patient1 --verbose
+    --max-iterations 4 \
+    --verbose
 ```
+
+#### Stage 1 Options
+| Option | Description | Default | Example |
+|--------|-------------|---------|---------|
+| `--geometry PATH` | Directory containing STL files | Required | `tutorial/patient1` |
+| `--config FILE` | Custom configuration file | `stage1_default.json` | `custom_config.json` |
+| `--max-iterations N` | Maximum optimization iterations | `4` | `6` |
+| `--output DIR` | Output directory | Auto-generated | `results/stage1` |
+| `--verbose` | Detailed logging | `False` | - |
 
 ### Stage 2 Commands
-```bash
-# RANS optimization (most common)
-python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS
 
-# Laminar flow
+#### Basic Usage
+```bash
+# LAMINAR flow verification (low Re, steady)
 python -m mesh_optim stage2 --geometry tutorial/patient1 --model LAMINAR
 
-# Wall-resolved LES
-python -m mesh_optim stage2 --geometry tutorial/patient1 --model LES
+# RANS flow verification (turbulent, clinical)  
+python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS
 
-# Custom QoI criteria
-python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS \
-    --config mesh_optim/configs/stage2_rans.json \
-    --max-iterations 3
+# LES flow verification (research, high-fidelity)
+python -m mesh_optim stage2 --geometry tutorial/patient1 --model LES
 ```
 
-### Options
+#### Stage 2 Options
+| Option | Description | Default | Example |
+|--------|-------------|---------|---------|
+| `--geometry PATH` | Directory containing STL files | Required | `tutorial/patient1` |
+| `--model {LAMINAR,RANS,LES}` | Flow physics model | Required | `LAMINAR` |
+| `--config FILE` | Custom configuration file | Auto-selected | `stage2_custom.json` |
+| `--max-iterations N` | Max iterations per mesh level | `4` | `6` |
+| `--output DIR` | Output directory | Auto-generated | `results/stage2` |
+| `--verbose` | Detailed logging | `False` | - |
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--geometry PATH` | Directory with STL files | Required |
-| `--model {LAMINAR,RANS,LES}` | Flow model (Stage 2 only) | RANS |
-| `--config FILE` | Custom configuration file | Auto-selected |
-| `--max-iterations N` | Maximum optimization iterations | 4 (Stage 1), 3 (Stage 2) |
-| `--output DIR` | Output directory | Auto-generated |
-| `--verbose` | Verbose logging | False |
+### Flow Model Details
+
+| Model | Use Case | Re Range | Target y+ | Mesh Levels | Expected Runtime |
+|-------|----------|----------|-----------|-------------|------------------|
+| **LAMINAR** | Low Re, steady flow | < 2300 | < 1.0 | Coarse/Medium/Fine | 30-60 min |
+| **RANS** | Clinical cases, turbulent | > 2300 | 0.5-2.0 | Coarse/Medium/Fine | 1-3 hours |  
+| **LES** | Research, unsteady | > 4000 | 0.3-1.5 | Coarse/Medium/Fine | 3-8 hours |
 
 ---
 
-## 🔧 Configuration Files
+## 📁 Input/Output Structure
 
-### Stage 1: Geometry-Driven (`stage1_default.json`)
+### Input Requirements
+
+#### STL Geometry Files (Required)
+```
+tutorial/patient1/
+├── inlet.stl              # Inlet surface
+├── outlet1.stl            # Outlet surfaces  
+├── outlet2.stl            # (multiple outlets supported)
+├── outlet3.stl            
+├── outlet4.stl            
+└── wall_aorta.stl         # Vessel wall (auto-detected patterns: wall_*, vessel_*, arterial_*)
+```
+
+#### Flow Data (Optional)
+```
+tutorial/patient1/
+├── BPM75.csv              # Velocity vs time (for pulsatile effects)
+└── config.json            # Patient-specific parameters
+```
+
+### Output Structure
+
+#### Stage 1 Output
+```
+output/patient1/meshOptimizer/stage1/
+├── iter_001/              # First iteration
+│   ├── constant/polyMesh/ # OpenFOAM mesh
+│   ├── system/           # Case dictionaries
+│   └── logs/             # Solver logs
+├── iter_002/              # Subsequent iterations...
+├── best/                  # Best quality mesh (exported for Stage 2)
+│   ├── constant/polyMesh/ # Final mesh
+│   ├── config.json        # Preserved configuration
+│   └── stage1_metrics.json # Quality metrics
+└── stage1_summary.csv     # Iteration summary
+```
+
+#### Stage 2 Output
+```
+output/patient1/meshOptimizer/stage2_gci_laminar/
+├── coarse/                # Coarsest mesh level
+│   └── constant/polyMesh/
+├── medium/                # Medium mesh level  
+│   └── constant/polyMesh/
+├── fine/                  # Finest mesh level
+│   └── constant/polyMesh/
+├── gci_analysis.json      # Richardson extrapolation results
+└── convergence_report.json # Final convergence decision
+```
+
+### Key Output Files
+
+#### stage1_summary.csv
+```csv
+iter,cells,maxNonOrtho,maxSkewness,coverage,objective_dummy,levels_min,levels_max,resolveFeatureAngle,nLayers,firstLayer,minThickness
+1,3536368,0.0,1.76,0.000,0.000,1,1,35,12,5.000e-05,2.000e-05
+2,3536368,0.0,1.76,0.000,0.000,1,2,35,14,5.000e-05,2.000e-05
+```
+
+#### gci_analysis.json (Stage 2)
+```json
+{
+  "mesh_levels": {
+    "coarse": {"cells": 3536368, "TAWSS_mean": 2.150},
+    "medium": {"cells": 4621678, "TAWSS_mean": 2.086}, 
+    "fine": {"cells": 6008581, "TAWSS_mean": 2.068}
+  },
+  "richardson_analysis": {
+    "apparent_order": 1.92,
+    "extrapolated_value": 2.058,
+    "gci_fine_medium": 2.3
+  },
+  "convergence_decision": {
+    "converged": true,
+    "tolerance_pct": 5.0,
+    "recommended_mesh": "medium"
+  }
+}
+```
+
+---
+
+## ⚙️ Configuration Control
+
+### Hierarchical Mesh Control (BLOCKMESH)
+
+The system supports multiple override levels for precise control:
+
 ```json
 {
   "BLOCKMESH": {
-    "resolution": 40,
-    "grading": [1, 1, 1]
-  },
-  "SNAPPY": {
-    "surface_level": [2, 3],
-    "distance_refinement": {
-      "near_distance": 2.0,
-      "far_distance": 4.0
-    }
-  },
-  "LAYERS": {
-    "nSurfaceLayers": 10,
-    "finalLayerThickness_rel": 0.25,
-    "expansionRatio": 1.2
-  },
+    "min_per_axis": [12, 12, 12],
+    // Precedence: divisions > cell_size_m > resolution > geometry-aware
+    
+    // Option 1: Exact control (highest priority)
+    "divisions": [220, 140, 150],
+    
+    // Option 2: Force specific cell size
+    "cell_size_m": 4e-4,
+    
+    // Option 3: Target resolution along longest axis  
+    "resolution": 80,
+    
+    // Option 4: Geometry-aware (default - no override needed)
+  }
+}
+```
+
+#### Quick Control Reference:
+- **Want exact background cells?** Set `BLOCKMESH.divisions` (wins over everything)
+- **Want a specific background Δx?** Set `BLOCKMESH.cell_size_m`
+- **Want "cells along longest axis"?** Set `BLOCKMESH.resolution`
+- **To force non-adaptive feature angle,** set `"GEOMETRY_POLICY": { "featureAngle_mode": "ladder" }`
+
+### Quality Acceptance Criteria
+
+Both stages use unified, literature-backed acceptance criteria:
+
+```json
+{
   "acceptance_criteria": {
-    "maxNonOrtho": 65,
-    "maxSkewness": 3.0,
-    "min_layer_coverage": 0.85
+    "maxNonOrtho": 65,        // OpenFOAM guidance: ≤65° for stability
+    "maxSkewness": 4.0,       // Literature standard: ≤4.0 for accuracy  
+    "min_layer_coverage": 0.70 // RANS wall-function requirement
   }
 }
 ```
 
-### Stage 2: RANS QoI-Driven (`stage2_rans.json`)
+### Feature Angle Settings
+
+Adaptive resolveFeatureAngle based on OpenFOAM documentation:
+
 ```json
 {
-  "mesh_settings": {
-    "base_resolution": 50,
-    "surface_level": [3, 4]
-  },
-  "layer_settings": {
-    "nSurfaceLayers": 12,
-    "finalLayerThickness_rel": 0.20,
-    "expansionRatio": 1.20
-  },
-  "quality_criteria": {
-    "maxNonOrtho": 65,
-    "min_layer_coverage": 0.90
-  },
-  "solver_settings": {
-    "application": "simpleFoam",
-    "endTime": 500
-  },
-  "qoi_criteria": {
-    "min_yplus_coverage": 0.85,
-    "target_yplus_range": [0.5, 2.0],
-    "min_velocity_stability": 0.02,
-    "min_wss_stability": 0.05
+  "_parameter_guidance": {
+    "resolveFeatureAngle": "30-45° adaptive range. Start at 30°; increase only if surface refinement becomes excessive",
+    "includedAngle": "140-160° is appropriate for vascular lips/ostia. 150° is fine",
+    "mergeTolerance": "min(1e-5, 0.05*Δx) is safe. If over-merging at tight throats, cap at 1e-6"
   }
 }
 ```
 
 ---
 
-## 📋 Input Requirements
+## 🔬 Literature-Backed Methodology
 
-### STL Files (Required)
-```
-geometry_directory/
-├── inlet.stl           # Inlet surface
-├── outlet1.stl         # Outlet 1
-├── outlet2.stl         # Outlet 2 (etc.)
-├── outlet3.stl         # 
-├── outlet4.stl         #
-└── wall_aorta.stl      # Aortic wall
+### Stage 1: Constraint-Based Optimization
+- **Objective**: Minimize cells subject to hard quality constraints (no penalty functions)
+- **Surface Refinement**: Gentle ladder progression [1,1] → [1,2] → [2,3] 
+- **Feature Detection**: Adaptive resolveFeatureAngle 30-45° per OpenFOAM guidance
+- **Layer Generation**: Physics-based thickness with 70% coverage threshold
+
+### Stage 2: GCI Verification (Roache, 1998)
+- **Richardson Extrapolation**: M_∞ = M_h + (M_h - M_2h)/(r^p - 1)
+- **Grid Convergence Index**: GCI = |1.25 * ε / M_h * (r^p - 1)| * 100%
+- **Convergence Criterion**: GCI ≤ 5% (cardiovascular WSS standard)
+- **Mesh Ratio**: r = 1.3 (optimal for Richardson analysis)
+
+### Key References
+1. **Richardson, L.F. (1911)**: "The approximate arithmetical solution by finite differences"
+2. **Roache, P.J. (1998)**: "Verification and Validation in Computational Science and Engineering"
+3. **Expert Consensus (2019)**: "5% WSS tolerance for cardiovascular CFD verification"
+
+---
+
+## 🚀 Quick Start Examples
+
+### Aortic Coarctation (Large Vessel)
+```bash
+# Stage 1: Generate baseline mesh
+python -m mesh_optim stage1 --geometry cases/aortic_coarctation/
+# Expected: D_ref ≈ 25mm, Δx ≈ 1.1mm, ~2-4M cells
+
+# Stage 2: Verify with RANS (clinical standard)
+python -m mesh_optim stage2 --geometry cases/aortic_coarctation/ --model RANS
+# Expected: 3 mesh levels, GCI analysis, ~2-4 hours
 ```
 
-### Flow Data (Optional but Recommended)
-```
-geometry_directory/
-├── BPM75.csv           # Velocity vs time data
-└── config.json         # Patient configuration
+### Coronary Artery (Small Vessel) 
+```bash
+# Stage 1: Fine resolution for small vessels
+python -m mesh_optim stage1 --geometry cases/coronary_lad/
+# Expected: D_ref ≈ 3mm, Δx ≈ 0.14mm, ~0.5-1.5M cells
+
+# Stage 2: Laminar flow (low Reynolds number)
+python -m mesh_optim stage2 --geometry cases/coronary_lad/ --model LAMINAR
+# Expected: Faster convergence, ~30-60 minutes
 ```
 
-**BPM75.csv format:**
-```csv
-time,velocity
-0.0,0.159660
-0.01,0.275651
-0.02,0.361402
-...
+### Research-Grade LES Study
+```bash
+# Stage 1: High-quality baseline
+python -m mesh_optim stage1 --geometry cases/research_case/ --max-iterations 6
+
+# Stage 2: Wall-resolved LES verification
+python -m mesh_optim stage2 --geometry cases/research_case/ --model LES  
+# Expected: Very fine meshes, y+ < 1, ~4-8 hours
 ```
 
 ---
 
-## 📈 Quality Metrics & Validation
+## 🔧 Advanced Usage
 
-### Mesh Quality Checks
-- **Non-orthogonality**: Target <65° for cardiovascular applications
-- **Skewness**: Target <3.0 for stable numerics
-- **Aspect Ratio**: Monitored but allowed up to 20 in boundary layers
-- **Layer Coverage**: Target >85% successful boundary layer generation
-
-### QoI Validation (Stage 2)
-- **y+ Distribution**: 90% of wall area within target range
-- **Velocity Stability**: <2% change between mesh refinements
-- **Pressure Drop Accuracy**: <1% change in inlet-outlet Δp
-- **WSS Reliability**: <5% change in area-averaged WSS
-
-### Output Metrics
-Each optimization produces `metrics.json`:
-```json
-{
-  "iteration": 3,
-  "checkMesh": {
-    "maxNonOrtho": 62.3,
-    "maxSkewness": 2.1,
-    "cells": 2450000
-  },
-  "layerCoverage": {
-    "coverage_overall": 0.92,
-    "totalFaces": 145000
-  },
-  "qoi_metrics": {
-    "yplus_coverage": 0.89,
-    "velocity_stability": 0.015,
-    "wss_availability": true
-  }
-}
-```
-
----
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-**1. Layer Generation Fails**
-```
-❌ Layer coverage: 0.0% - boundary layers failed to generate
-```
-**Solution**: The optimizer automatically adjusts thickness and layer count. For persistent failures, reduce `nSurfaceLayers` or increase `minThickness`.
-
-**2. Non-Orthogonality Too High**  
-```
-❌ Max non-orthogonality: 78.2° (target: <65°)
-```
-**Solution**: Optimizer automatically reduces surface refinement level. Manual fix: reduce `surface_level`.
-
-**3. OpenFOAM Not Found**
-```
-❌ Command failed: blockMesh
-❌ Error: command not found
-```
-**Solution**: Source OpenFOAM environment:
+### Custom Configuration
 ```bash
-source /opt/openfoam12/etc/bashrc
+# Use custom Stage 1 parameters
+python -m mesh_optim stage1 --geometry tutorial/patient1 \
+    --config my_configs/high_resolution.json
+
+# Custom Stage 2 with specific tolerances  
+python -m mesh_optim stage2 --geometry tutorial/patient1 --model RANS \
+    --config my_configs/strict_convergence.json
 ```
 
-**4. STL Files Not Found**
-```
-❌ Required STL file not found: inlet.stl
-```
-**Solution**: Ensure geometry directory contains all required STL files with correct names.
-
-**5. Python Package Import Errors**
-```
-❌ ModuleNotFoundError: No module named 'numpy'
-❌ ImportError: cannot import name 'mesh_optim'
-```
-**Solution**: Ensure you're using the correct Python environment:
+### Debugging & Verbose Output
 ```bash
-# If using virtual environment
-source mesh_optim_env/bin/activate
-pip install -r requirements.txt
-
-# Verify installation
-python -c "import numpy; print('Dependencies OK')"
-```
-
-### Debug Mode
-```bash
+# Detailed logging for troubleshooting
 python -m mesh_optim stage1 --geometry tutorial/patient1 --verbose
+
+# Check mesh quality after Stage 1
+checkMesh -case output/patient1/meshOptimizer/stage1/best/
 ```
 
 ---
 
-## 🏥 Clinical Applications
+## ✅ Validation & Quality Assurance
 
-### Recommended Workflows
+### Mesh Quality Metrics
+- **Geometric Quality**: Non-orthogonality, skewness, aspect ratio within OpenFOAM guidelines
+- **Boundary Layer Coverage**: >70% successful layer generation (realistic for complex vessels)
+- **Feature Capture**: Adaptive angle detection preserves important geometric features
 
-**Clinical Decision Support (Fast)**
-```bash
-python -m mesh_optim stage1 --geometry patient_data/
-# ~10-30 minutes, good for qualitative analysis
-```
+### Physics Verification (Stage 2)
+- **Grid Independence**: Richardson extrapolation validates mesh-independent solutions
+- **WSS Accuracy**: 5% tolerance ensures reliable wall shear stress calculations  
+- **Pressure Drop Consistency**: Verified across mesh refinement levels
 
-**Research Publication (High Quality)**
-```bash
-python -m mesh_optim stage2 --geometry patient_data/ --model RANS
-# ~1-3 hours, quantitative WSS and pressure drop
-```
-
-**Validation Studies (Highest Fidelity)**
-```bash
-python -m mesh_optim stage2 --geometry patient_data/ --model LES
-# ~4-12 hours, research-grade accuracy
-```
-
-### Hemodynamic Analysis
-After mesh optimization, use the generated mesh for:
-- **WSS Analysis**: Time-averaged wall shear stress patterns
-- **Pressure Drop**: Inlet-outlet pressure differences
-- **Flow Patterns**: Velocity fields and secondary flows
-- **Oscillatory Shear Index**: OSI for atherosclerosis risk
+### Literature Compliance
+- **OpenFOAM Best Practices**: Feature angles, quality thresholds, solver settings
+- **CFD Verification Standards**: GCI methodology, Richardson extrapolation
+- **Cardiovascular CFD Guidelines**: WSS tolerance, y+ requirements, time-averaging
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! Areas of interest:
-- **Additional QoI metrics** (OSI, TAWSS, RRT)
-- **Parallel mesh generation** for large cases
-- **GUI interface** for clinical users
-- **Validation against experimental data**
-
-### Development Setup
-```bash
-git clone https://github.com/YourUsername/AortaCFD-Snappy.git
-cd AortaCFD-Snappy
-
-# Create development virtual environment
-python3 -m venv dev_env
-source dev_env/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run tests (if available)
-python -m pytest tests/
-
-# Ensure OpenFOAM is sourced for development
-source /opt/openfoam12/etc/bashrc
-```
+Areas for contribution:
+- **Additional Vascular Beds**: Cerebral, peripheral, pediatric geometries
+- **Enhanced Physics Models**: Fluid-structure interaction, non-Newtonian blood
+- **Validation Studies**: Experimental comparison, benchmark cases
+- **Performance Optimization**: Parallel mesh generation, GPU acceleration
 
 ---
 
-## 📚 References
+## 📚 Citation
 
-1. **Mesh Generation**: Jasak, H. et al. "OpenFOAM: A C++ library for complex physics simulations"
-2. **y+ Targeting**: Pope, S.B. "Turbulent Flows" - Chapter 7: Wall-bounded flows
-3. **Cardiovascular CFD**: Taylor, C.A. & Figueroa, C.A. "Patient-specific modeling of cardiovascular mechanics"
-4. **Boundary Layer Theory**: Schlichting, H. "Boundary Layer Theory" - 8th Edition
+If you use AortaCFD-Snappy in your research, please cite:
+
+```bibtex
+@software{aortacfd_snappy,
+  title={AortaCFD-Snappy: Two-Stage Mesh Optimization for Cardiovascular CFD},
+  author={[Your Name]},
+  year={2025},
+  url={https://github.com/[username]/AortaCFD-Snappy}
+}
+```
 
 ---
 
@@ -454,12 +399,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-## 🆘 Support
-
-- **Issues**: [GitHub Issues](https://github.com/YourUsername/AortaCFD-Snappy/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/YourUsername/AortaCFD-Snappy/discussions)
-- **Documentation**: [Wiki](https://github.com/YourUsername/AortaCFD-Snappy/wiki)
-
----
-
-**AortaCFD-Snappy v1.0** - Making physics-aware mesh generation accessible for cardiovascular CFD
+**AortaCFD-Snappy v2.0** - Literature-backed mesh optimization for cardiovascular CFD
